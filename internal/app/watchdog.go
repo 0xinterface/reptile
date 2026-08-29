@@ -41,10 +41,12 @@ func cycle(s wdState, tunnelOK bool, reason string, verify, egressOK bool, downC
 }
 
 // runWatchdog drives cycle on the poll ticker until ctx is cancelled.
+// live is re-read every cycle, so hot-reloaded settings take effect without
+// a restart (the poll ticker resets itself when poll_interval changes).
 // proof returns the egress checker's last observed (ip, country) for the
-// periodic heartbeat line; every poll's verdict is published to store for
-// the agent socket. A heartbeat_interval of 0 disables heartbeats.
-func runWatchdog(ctx context.Context, cfg Config, tunnel func() (bool, string), egress func() (bool, string), proof func() (string, string), killer func(), store *Store, logf func(string, ...any)) error {
+// periodic heartbeat line. A heartbeat_interval of 0 disables heartbeats.
+func runWatchdog(ctx context.Context, live *Live, tunnel func() (bool, string), egress func() (bool, string), proof func() (string, string), killer func(), store *Store, logf func(string, ...any)) error {
+	cfg := live.Get()
 	d, err := cfg.Durations()
 	if err != nil {
 		return err
@@ -52,7 +54,8 @@ func runWatchdog(ctx context.Context, cfg Config, tunnel func() (bool, string), 
 	logf("watchdog started: iface=%s poll=%s max_handshake_age=%s verify_egress=%v heartbeat=%s targets=%v",
 		cfg.Interface, cfg.PollInterval, cfg.MaxHandshakeAge, cfg.VerifyEgress, cfg.HeartbeatInterval, cfg.Targets)
 
-	ticker := time.NewTicker(d.poll)
+	pollDur := d.poll
+	ticker := time.NewTicker(pollDur)
 	defer ticker.Stop()
 	var heartbeatC <-chan time.Time
 	if d.heartbeat > 0 {
@@ -73,6 +76,15 @@ func runWatchdog(ctx context.Context, cfg Config, tunnel func() (bool, string), 
 			logf(fmt.Sprintf("heartbeat: state=%s streak=%d exit_ip=%s country=%s",
 				stateLabel(state), state.streak, ip, country))
 			continue
+		}
+
+		cfg := live.Get()
+		if d, err := cfg.Durations(); err != nil {
+			logf(fmt.Sprintf("config invalid, keeping previous settings: %v", err))
+		} else if d.poll != pollDur {
+			pollDur = d.poll
+			ticker.Reset(pollDur)
+			logf(fmt.Sprintf("poll_interval applied: %s", pollDur))
 		}
 
 		tOK, tReason := tunnel()

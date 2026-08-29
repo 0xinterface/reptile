@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -43,7 +44,11 @@ func parseLatestHandshake(dump string) int64 {
 	return latest
 }
 
+// TunnelChecker reports whether the tunnel works at the transport level.
+// Apply hot-swaps config-derived fields under the same mutex Check holds.
 type TunnelChecker struct {
+	mu sync.Mutex
+
 	Iface      string
 	MaxAge     time.Duration
 	PingTarget string
@@ -51,17 +56,34 @@ type TunnelChecker struct {
 	Now        func() time.Time
 }
 
+// Apply hot-applies the mutable subset of a new config. Invalid durations
+// are rejected so a reload can fall back to the previous settings.
+func (t *TunnelChecker) Apply(c Config) error {
+	maxAge, err := time.ParseDuration(c.MaxHandshakeAge)
+	if err != nil {
+		return fmt.Errorf("max_handshake_age: %w", err)
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.MaxAge = maxAge
+	t.PingTarget = c.PingTarget
+	return nil
+}
+
 // Check reports whether the tunnel works at the transport level: the
 // interface answers and its freshest peer handshake is recent. WireGuard
 // interfaces stay UP while peers vanish, so handshake staleness is the only
 // authoritative liveness signal.
-func (tc *TunnelChecker) Check(ctx context.Context) (bool, string) {
-	if tc.PingTarget != "" {
+func (t *TunnelChecker) Check(ctx context.Context) (bool, string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.PingTarget != "" {
 		// Best-effort: forces a fresh handshake on an otherwise idle tunnel
 		// so staleness below is a meaningful disconnect signal.
-		_, _ = tc.Runner.Run(ctx, "ping", "-n", "-q", "-c", "1", "-W", "2", "-I", tc.Iface, tc.PingTarget)
+		_, _ = t.Runner.Run(ctx, "ping", "-n", "-q", "-c", "1", "-W", "2", "-I", t.Iface, t.PingTarget)
 	}
-	dump, err := tc.Runner.Run(ctx, "wg", "show", tc.Iface, "dump")
+	dump, err := t.Runner.Run(ctx, "wg", "show", t.Iface, "dump")
 	if err != nil {
 		return false, "wg show failed (interface missing or not a WireGuard device)"
 	}
@@ -69,9 +91,16 @@ func (tc *TunnelChecker) Check(ctx context.Context) (bool, string) {
 	if latest == 0 {
 		return false, "no handshake recorded"
 	}
-	age := tc.Now().Unix() - latest
-	if age > int64(tc.MaxAge.Seconds()) {
-		return false, fmt.Sprintf("handshake %ds old (max %ds)", age, int64(tc.MaxAge.Seconds()))
+	age := t.now().Unix() - latest
+	if age > int64(t.MaxAge.Seconds()) {
+		return false, fmt.Sprintf("handshake %ds old (max %ds)", age, int64(t.MaxAge.Seconds()))
 	}
 	return true, ""
+}
+
+func (t *TunnelChecker) now() time.Time {
+	if t.Now != nil {
+		return t.Now()
+	}
+	return time.Now()
 }

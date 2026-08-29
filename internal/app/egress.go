@@ -6,8 +6,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -25,7 +27,12 @@ type ALookup interface {
 // After every Check, LastCountry/LastIP hold the observed probe values and
 // Probed reports whether this call actually hit the network (false when the
 // verdict came from cache).
+//
+// Apply hot-swaps config-derived fields under the same mutex that Check
+// holds, so the agent goroutine can reconfigure while the poll loop probes.
 type EgressChecker struct {
+	mu sync.Mutex
+
 	Iface           string
 	URL             string
 	CountryRe       *regexp.Regexp
@@ -48,6 +55,43 @@ type EgressChecker struct {
 	reason  string
 	ts      time.Time
 	set     bool
+}
+
+// Apply hot-applies the mutable subset of a new config. Config fields are
+// validated first (patterns compile, URL parses, durations parse); on error
+// nothing is mutated.
+func (e *EgressChecker) Apply(c Config) error {
+	countryRe, err := regexp.Compile(c.CountryPattern)
+	if err != nil {
+		return fmt.Errorf("country_pattern: %w", err)
+	}
+	ipRe, err := regexp.Compile(c.IPPattern)
+	if err != nil {
+		return fmt.Errorf("ip_pattern: %w", err)
+	}
+	if _, err := url.Parse(c.ProbeURL); err != nil {
+		return fmt.Errorf("probe_url: %w", err)
+	}
+	timeout, err := time.ParseDuration(c.ProbeTimeout)
+	if err != nil {
+		return fmt.Errorf("probe_timeout: %w", err)
+	}
+	ttl, err := time.ParseDuration(c.ProbeInterval)
+	if err != nil {
+		return fmt.Errorf("probe_interval: %w", err)
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.Iface = c.Interface
+	e.URL = c.ProbeURL
+	e.CountryRe, e.IPRe = countryRe, ipRe
+	e.Timeout, e.TTL = timeout, ttl
+	e.ExpectedCountry = strings.ToUpper(strings.TrimSpace(c.ExpectedCountry))
+	e.ExpectedIP = c.ExpectedIP
+	e.Zones = c.DNSBLZones
+	e.set = false // force a re-probe under the new settings
+	return nil
 }
 
 func (e *EgressChecker) now() time.Time {
@@ -74,6 +118,9 @@ func (e *EgressChecker) client() *http.Client {
 }
 
 func (e *EgressChecker) Check(ctx context.Context) (bool, string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	now := e.now()
 	if e.set && now.Sub(e.ts) < e.TTL {
 		e.Probed = false
@@ -87,7 +134,9 @@ func (e *EgressChecker) Check(ctx context.Context) (bool, string) {
 
 // CheckFresh bypasses the verdict cache and runs a probe now.
 func (e *EgressChecker) CheckFresh(ctx context.Context) (bool, string) {
+	e.mu.Lock()
 	e.set = false
+	e.mu.Unlock()
 	return e.Check(ctx)
 }
 

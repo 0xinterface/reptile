@@ -62,18 +62,23 @@ type agentRequest struct {
 }
 
 type agentResponse struct {
-	OK     bool    `json:"ok"`
-	Error  string  `json:"error,omitempty"`
-	Status *Status `json:"status,omitempty"`
+	OK              bool     `json:"ok"`
+	Error           string   `json:"error,omitempty"`
+	Status          *Status  `json:"status,omitempty"`
+	Applied         []string `json:"applied,omitempty"`
+	RestartRequired []string `json:"restart_required,omitempty"`
 }
 
 // Server serves the newline-JSON agent protocol on a unix socket:
-// the client sends {"cmd":"status"} or {"cmd":"probe"} and receives one
-// JSON agentResponse.
+// status, probe, and reload. Each connection carries exactly one request
+// and one response.
 type Server struct {
 	path   string
 	store  *Store
 	prober func() Status
+	// Reloader hot-applies a freshly read config; applied lists the keys
+	// that took effect, restartRequired the ones needing a daemon restart.
+	Reloader func() (applied []string, restartRequired []string, err error)
 
 	mu     sync.Mutex
 	closed bool
@@ -112,8 +117,7 @@ func (s *Server) Close() error {
 	return nil
 }
 
-// Serve accepts connections until the listener is closed. Each connection
-// carries exactly one request and one response.
+// Serve accepts connections until the listener is closed.
 func (s *Server) Serve(l net.Listener) error {
 	for {
 		conn, err := l.Accept()
@@ -147,6 +151,22 @@ func (s *Server) handle(conn net.Conn) {
 			st = s.prober()
 		}
 		_ = json.NewEncoder(conn).Encode(agentResponse{OK: true, Status: &st})
+	case "reload":
+		if s.Reloader == nil {
+			_ = json.NewEncoder(conn).Encode(agentResponse{OK: false, Error: "reload unsupported"})
+			return
+		}
+		applied, restartRequired, err := s.Reloader()
+		if err != nil {
+			_ = json.NewEncoder(conn).Encode(agentResponse{OK: false, Error: err.Error()})
+			return
+		}
+		_ = json.NewEncoder(conn).Encode(agentResponse{
+			OK:              true,
+			Status:          func() *Status { st := s.store.Snapshot(); return &st }(),
+			Applied:         applied,
+			RestartRequired: restartRequired,
+		})
 	default:
 		_ = json.NewEncoder(conn).Encode(agentResponse{OK: false, Error: fmt.Sprintf("unknown command %q", req.Cmd)})
 	}
@@ -155,23 +175,33 @@ func (s *Server) handle(conn net.Conn) {
 // Query is the client side: connects to the agent socket, sends one command,
 // returns the status payload. Non-OK responses surface as errors.
 func Query(path string, cmd string) (Status, error) {
-	conn, err := net.Dial("unix", path)
+	r, err := QueryResponse(path, cmd)
 	if err != nil {
 		return Status{}, err
-	}
-	defer conn.Close()
-	if err := json.NewEncoder(conn).Encode(agentRequest{Cmd: cmd}); err != nil {
-		return Status{}, err
-	}
-	var r agentResponse
-	if err := json.NewDecoder(conn).Decode(&r); err != nil {
-		return Status{}, err
-	}
-	if !r.OK {
-		return Status{}, fmt.Errorf("%s", r.Error)
 	}
 	if r.Status == nil {
 		return Status{}, fmt.Errorf("empty response")
 	}
 	return *r.Status, nil
+}
+
+// QueryResponse is Query without the status extraction; reload responses
+// carry Applied/RestartRequired lists.
+func QueryResponse(path string, cmd string) (agentResponse, error) {
+	conn, err := net.Dial("unix", path)
+	if err != nil {
+		return agentResponse{}, err
+	}
+	defer conn.Close()
+	if err := json.NewEncoder(conn).Encode(agentRequest{Cmd: cmd}); err != nil {
+		return agentResponse{}, err
+	}
+	var r agentResponse
+	if err := json.NewDecoder(conn).Decode(&r); err != nil {
+		return agentResponse{}, err
+	}
+	if !r.OK {
+		return agentResponse{}, fmt.Errorf("%s", r.Error)
+	}
+	return r, nil
 }

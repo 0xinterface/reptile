@@ -16,6 +16,17 @@ import (
 
 const defaultConfigPath = "/etc/reptile/config.json"
 
+// restartRequiredKeys are settings that only take effect when the daemon
+// restarts (they wire up listeners, log sinks or runners at startup).
+var restartRequiredKeys = map[string]bool{
+	"interface":          true,
+	"socket_path":        true,
+	"log_file":           true,
+	"wg_conf":            true,
+	"extra_accept":       true,
+	"heartbeat_interval": true,
+}
+
 func Run() {
 	var (
 		configPath = flag.String("config", defaultConfigPath, "path to config.json")
@@ -27,6 +38,17 @@ func Run() {
 	// so the handler omits its own clock; interactively it adds short time.
 	slog.SetDefault(slog.New(NewConsoleHandler(os.Stderr, stderrIsTTY())))
 
+	// install must run WITHOUT a config file: on a fresh host it creates
+	// the one every other subcommand needs.
+	sub := flag.Args()
+	subCmd, subArgs := "", []string(nil)
+	if len(sub) > 0 {
+		subCmd, subArgs = sub[0], sub[1:]
+	}
+	if subCmd == "install" {
+		os.Exit(runInstall(subArgs))
+	}
+
 	cfg, err := LoadConfig(*configPath)
 	if err != nil {
 		fatal("load config: %v", err)
@@ -35,15 +57,10 @@ func Run() {
 		cfg.Interface = *ifaceFlag
 	}
 
-	sub := flag.Args()
-	subCmd, subArgs := "", []string(nil)
-	if len(sub) > 0 {
-		subCmd, subArgs = sub[0], sub[1:]
-	}
 	switch subCmd {
 	case "standby", "daemon":
 		mustValidate(cfg)
-		runDaemon(cfg)
+		runDaemon(cfg, *configPath)
 	case "check":
 		mustValidate(cfg)
 		os.Exit(runCheck(cfg))
@@ -51,12 +68,12 @@ func Run() {
 		os.Exit(runStatus(cfg, subArgs))
 	case "history":
 		os.Exit(runHistory(cfg, subArgs))
-	case "install":
-		os.Exit(runInstall(subArgs))
+	case "config":
+		os.Exit(runConfig(*configPath, subArgs))
 	case "firewall":
 		runFirewall(cfg, flag.Arg(1))
 	default:
-		fatal("usage: reptile [-config path] [-interface wg0] standby|status|history|check|install|firewall up|down")
+		fatal("usage: reptile [-config path] [-interface wg0] standby|status|history|config [set]|check|install|firewall up|down")
 	}
 }
 
@@ -129,7 +146,7 @@ func openLogFile(path string) {
 	slog.SetDefault(slog.New(NewFanoutHandler(slog.Default().Handler(), NewConsoleHandler(f, true))))
 }
 
-func runDaemon(cfg Config) {
+func runDaemon(cfg Config, configPath string) {
 	d, err := cfg.Durations()
 	if err != nil {
 		fatal("config: %v", err)
@@ -137,6 +154,7 @@ func runDaemon(cfg Config) {
 	if cfg.LogFile != "" {
 		openLogFile(cfg.LogFile)
 	}
+	live := NewLive(cfg)
 	tc, eg := buildCheckers(cfg)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -144,8 +162,9 @@ func runDaemon(cfg Config) {
 	store := NewStore()
 	if cfg.SocketPath != "" {
 		srv := NewServer(cfg.SocketPath, store, func() Status {
-			return probeNow(cfg, tc, eg, ctx, store)
+			return probeNow(live, tc, eg, ctx, store)
 		})
+		srv.Reloader = makeReloader(configPath, live, tc, eg)
 		ln, err := srv.Listen()
 		if err != nil {
 			fatal("agent socket: %v", err)
@@ -166,7 +185,12 @@ func runDaemon(cfg Config) {
 		slog.Warn("sent "+event, "comm", comm, "pid", pid)
 	}
 	killer := func() {
-		KillTargets(ctx, procLister{}, cfg.Targets, d.killGrace, killLog)
+		c := live.Get()
+		gd, err := c.Durations()
+		if err != nil {
+			gd = d
+		}
+		KillTargets(ctx, procLister{}, c.Targets, gd.killGrace, killLog)
 	}
 	egress := func() (bool, string) {
 		ok, reason := eg.Check(ctx)
@@ -180,10 +204,13 @@ func runDaemon(cfg Config) {
 		}
 		return ok, reason
 	}
-	proof := func() (string, string) { return eg.LastIP, eg.LastCountry }
+	proof := func() (string, string) {
+		st := store.Snapshot()
+		return st.ExitIP, st.Country
+	}
 	logf := func(format string, args ...any) { slog.Info(fmt.Sprintf(format, args...)) }
 
-	if err := runWatchdog(ctx, cfg,
+	if err := runWatchdog(ctx, live,
 		func() (bool, string) { return tc.Check(ctx) },
 		egress,
 		proof,
@@ -195,17 +222,48 @@ func runDaemon(cfg Config) {
 	}
 }
 
+// makeReloader returns the agent "reload" implementation: re-read the config
+// file, hot-apply everything that can change safely on a running daemon
+// (checkers, thresholds, targets, probe settings), and report which changed
+// keys need a restart instead.
+func makeReloader(configPath string, live *Live, tc *TunnelChecker, eg *EgressChecker) func() ([]string, []string, error) {
+	return func() ([]string, []string, error) {
+		newCfg, err := LoadConfig(configPath)
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := eg.Apply(newCfg); err != nil {
+			return nil, nil, err
+		}
+		if err := tc.Apply(newCfg); err != nil {
+			return nil, nil, err
+		}
+		old := live.Get()
+		live.Set(newCfg)
+		changed := diffKeys(old, newCfg)
+		var restart []string
+		for _, k := range changed {
+			if restartRequiredKeys[k] {
+				restart = append(restart, k)
+			}
+		}
+		slog.Info("config reloaded", "changed", strings.Join(changed, ","))
+		return changed, restart, nil
+	}
+}
+
 // probeNow runs a full fresh evaluation for the agent "probe" command and
 // publishes the result without touching the poll loop's debounce streak.
-func probeNow(cfg Config, tc *TunnelChecker, eg *EgressChecker, ctx context.Context, store *Store) Status {
+func probeNow(live *Live, tc *TunnelChecker, eg *EgressChecker, ctx context.Context, store *Store) Status {
+	c := live.Get()
 	tOK, tReason := tc.Check(ctx)
 	eOK := false
 	reason := tReason
-	if cfg.VerifyEgress && tOK {
+	if c.VerifyEgress && tOK {
 		eOK, reason = eg.CheckFresh(ctx)
 	}
 	state := "up"
-	if !(tOK && (!cfg.VerifyEgress || eOK)) {
+	if !(tOK && (!c.VerifyEgress || eOK)) {
 		state = "down"
 	}
 	store.Set(state, store.Snapshot().Streak, reason, eg.LastIP, eg.LastCountry)
@@ -276,6 +334,64 @@ func runHistory(cfg Config, args []string) int {
 	if err := RenderEntries(os.Stdout, entries, !*noColor && stdoutIsTTY()); err != nil {
 		slog.Error(fmt.Sprintf("render: %v", err))
 		return 1
+	}
+	return 0
+}
+
+// runConfig implements `reptile config` (display the effective config as a
+// table) and `reptile config set key value ...` (validate + persist, then
+// hot-reload the running daemon via its agent socket).
+func runConfig(configPath string, args []string) int {
+	if len(args) == 0 || args[0] != "set" {
+		if len(args) > 0 {
+			slog.Error(fmt.Sprintf("unknown config command %q (want: set)", args[0]))
+			return 2
+		}
+		cfg, err := LoadConfig(configPath)
+		if err != nil {
+			slog.Error(fmt.Sprintf("load config: %v", err))
+			return 1
+		}
+		if err := RenderConfigTable(os.Stdout, cfg); err != nil {
+			slog.Error(fmt.Sprintf("render: %v", err))
+			return 1
+		}
+		return 0
+	}
+
+	pairs := args[1:]
+	if len(pairs) == 0 {
+		slog.Error("usage: reptile config set key value [key value ...]")
+		return 2
+	}
+	if _, err := SetConfigFileKeys(configPath, pairs); err != nil {
+		slog.Error(fmt.Sprintf("config set: %v", err))
+		return 1
+	}
+
+	fresh, err := LoadConfig(configPath)
+	if err != nil {
+		slog.Error(fmt.Sprintf("reload config: %v", err))
+		return 1
+	}
+	if fresh.SocketPath == "" {
+		slog.Info("saved; agent socket disabled, changes apply on next start")
+		return 0
+	}
+	resp, err := QueryResponse(fresh.SocketPath, "reload")
+	switch {
+	case err == nil:
+		if len(resp.Applied) > 0 {
+			slog.Info("applied live", "keys", strings.Join(resp.Applied, ","))
+		} else {
+			slog.Info("daemon reports no effective changes")
+		}
+		if len(resp.RestartRequired) > 0 {
+			slog.Warn("restart required for these keys", "keys", strings.Join(resp.RestartRequired, ","))
+		}
+	default:
+		slog.Warn("daemon not reloaded live", "err", err.Error())
+		slog.Info("changes apply on next start: systemctl restart reptile")
 	}
 	return 0
 }

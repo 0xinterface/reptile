@@ -2,6 +2,7 @@ package app
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -83,5 +84,36 @@ func TestEmbeddedAssetsExist(t *testing.T) {
 		if _, err := assets.ReadFile(name); err != nil {
 			t.Errorf("embedded asset %s: %v", name, err)
 		}
+	}
+}
+
+// Regression: on a fresh host /etc/reptile/config.json does not exist yet;
+// `reptile install` must not require the file it is about to create.
+func TestHelperInstallProcess(t *testing.T) {
+	if os.Getenv("REPTILE_HELPER") != "install" {
+		return
+	}
+	os.Args = []string{"reptile", "install",
+		"--root", os.Getenv("REPTILE_HELPER_ROOT"), "--no-activate"}
+	Run()
+}
+
+func TestInstallSubcommandOnFreshHost(t *testing.T) {
+	root := t.TempDir()
+	cmd := exec.Command(os.Args[0], "-test.run=TestHelperInstallProcess$", "-test.v")
+	cmd.Env = append(os.Environ(),
+		"REPTILE_HELPER=install",
+		"REPTILE_HELPER_ROOT="+root,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install on fresh host failed: %v\n%s", err, out)
+	}
+	cfg, err := os.ReadFile(filepath.Join(root, "etc/reptile/config.json"))
+	if err != nil {
+		t.Fatalf("config not placed: %v", err)
+	}
+	if !strings.Contains(string(cfg), `"expected_country": "CHANGE_ME"`) {
+		t.Error("placed config is not the example sentinel")
 	}
 }

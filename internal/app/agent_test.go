@@ -110,3 +110,37 @@ func TestQueryUnreachableSocket(t *testing.T) {
 }
 
 var _ = context.Background
+
+func TestAgentReloadCommand(t *testing.T) {
+	t.Chdir(t.TempDir())
+	calls := 0
+	srv := NewServer("agent.sock", NewStore(), nil)
+	srv.Reloader = func() ([]string, []string, error) {
+		calls++
+		return []string{"expected_country"}, []string{"interface"}, nil
+	}
+	ln, err := srv.Listen()
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = ln.Close() })
+
+	resp, err := QueryResponse("agent.sock", "reload")
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("reloader calls = %d, want 1", calls)
+	}
+	if len(resp.Applied) != 1 || resp.Applied[0] != "expected_country" {
+		t.Errorf("applied = %v", resp.Applied)
+	}
+	if len(resp.RestartRequired) != 1 || resp.RestartRequired[0] != "interface" {
+		t.Errorf("restart_required = %v", resp.RestartRequired)
+	}
+
+	if _, err = QueryResponse("agent.sock", "reload-nonsense"); err == nil {
+		t.Error("unknown command must error")
+	}
+}
