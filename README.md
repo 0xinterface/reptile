@@ -1,0 +1,248 @@
+# reptile
+
+A WireGuard kill switch for Linux. `reptile` watches a designated WireGuard
+tunnel, continuously proves that traffic is really exiting where it should,
+and **kills configured processes whenever that proof breaks** — closing the
+gap between "the interface is up" and "the tunnel is actually safe".
+
+Two independent layers:
+
+1. **Watchdog daemon** (`standby`) — polls the tunnel and, while any safety
+   condition fails, repeatedly `SIGTERM`/`SIGKILL`s your target processes
+   (so processes started mid-outage die too).
+2. **nftables kill switch** (`firewall up`) — always-on egress policy:
+   everything leaves the host **only** via the tunnel, except the WireGuard
+   transport ports (so it can reconnect), loopback, and DHCP. Leaks are
+   structurally impossible even before the watchdog reacts.
+
+## Why "interface is up" is not enough
+
+A WireGuard interface does not disconnect: `wg0` keeps its address while the
+peer silently vanishes. The only authoritative liveness signal is the
+**latest handshake age**. On top of that, a working tunnel can still exit in
+the wrong country or through a rotten IP, so reptile treats "safe" as a
+conjunction that must all hold:
+
+| # | condition | source |
+|---|-----------|--------|
+| 1 | interface exists | `ip link` via `wg show <iface> dump` |
+| 2 | freshest peer handshake ≤ `max_handshake_age` | same (peer lines, field 4) |
+| 3 | probe bound to the tunnel resolves to `expected_country` (and `expected_ip` if set) | HTTPS probe with `SO_BINDTODEVICE` |
+| 4 | exit IP not listed in any `dnsbl_zones` | reverse-IP DNSBL A-lookups |
+
+Everything is **fail-closed**: a probe timeout, an unparsable answer, or a
+DNS hiccup in the geo path counts as *unproven*, and unproven means kill.
+(Blacklist infra errors alone degrade to a warning; only an actual
+`127.0.0.0/8` DNSBL answer counts as a hit.)
+
+Install, set `expected_country` and `targets`, enable two units — done.
+
+## Requirements
+
+- Linux (systemd), WireGuard via `wg-quick` (`/etc/wireguard/<iface>.conf`)
+- root (the daemon needs `CAP_KILL`, `CAP_NET_ADMIN`, `CAP_NET_RAW`)
+- `wg`, `nft`, `curl` on PATH
+
+## Install
+
+From a machine with Go:
+
+```sh
+go install github.com/0xinterface/reptile/cmd/reptile@latest
+sudo reptile install
+```
+
+`install` self-copies the binary to `/usr/local/bin/reptile`, writes the
+example config to `/etc/reptile/config.json` (never overwrites an existing
+one), installs the embedded systemd units, and activates them. The watchdog
+refuses to start until you replace the `CHANGE_ME` placeholders:
+
+```sh
+sudoedit /etc/reptile/config.json   # set targets + expected_country
+sudo systemctl start reptile
+reptile check && journalctl -u reptile -f
+```
+
+`--root <dir>` installs into a directory tree instead (containers/testing),
+`--no-activate` skips systemctl. Release binaries are also cross-compiled
+per push in CI (`dist/reptile-linux-amd64|arm64`): drop one on the host and
+run `sudo ./reptile install`.
+
+## Commands
+
+| command | purpose |
+|---|---|
+| `reptile standby` | run the watchdog daemon (agent socket + log file tee). `daemon` is an alias. |
+| `reptile status [-probe]` | query the running daemon over its socket; `-probe` forces a fresh egress evaluation. Exit 1 when down. |
+| `reptile history [-n N] [-level info\|warn\|error] [--no-color]` | recent events from the log file with level highlighting; works while the daemon is down |
+| `reptile check` | one-shot evaluation of every configured condition; exit 0 = proven safe |
+| `reptile install [flags]` | see above |
+| `reptile firewall up\|down` | engage/remove the nftables kill switch (normally managed by its unit) |
+
+## Configuration
+
+`/etc/reptile/config.json` — JSON over defaults; absent keys keep defaults.
+Path defaults: config `/etc/reptile/config.json`, socket
+`/run/reptile/agent.sock`, log `/var/lib/reptile/events.log`.
+
+```jsonc
+{
+  "interface": "wg0",
+  "poll_interval": "10s",        // watchdog cadence
+  "max_handshake_age": "180s",   // handshake older than this = transport dead
+  "down_cycles_to_kill": 2,      // consecutive failing polls before killing
+  "kill_grace": "3s",            // SIGTERM -> wait -> SIGKILL
+  "heartbeat_interval": "10m",   // periodic state log line; "0s" disables
+  "ping_target": "",             // optional tunnel IP; pinged each poll to
+                                 //   force handshakes on an idle tunnel
+  "verify_egress": true,
+  "expected_country": "CH",      // REQUIRED: two-letter ISO country of the exit
+  "expected_ip": "",             // optional exact exit IP pin
+  "probe_url": "https://1.1.1.1/cdn-cgi/trace",
+  "country_pattern": "(?m)^loc=([A-Z]{2})",
+  "ip_pattern": "(?m)^ip=([0-9a-fA-F.:]+)",
+  "probe_interval": "300s",      // egress verdict cache TTL
+  "probe_timeout": "5s",
+  "dnsbl_zones": ["zen.spamhaus.org", "b.barracudacentral.org", "bl.spamcop.net"],
+  "targets": ["transmission-daemon"],  // exact comm names, 15-char limit
+  "wg_conf": "/etc/wireguard/wg0.conf",
+  "extra_accept": [],            // raw nft rules appended to the output chain
+  "socket_path": "/run/reptile/agent.sock",  // "" disables the agent
+  "log_file": "/var/lib/reptile/events.log"  // "" disables the file sink
+}
+```
+
+Notes:
+
+- `targets` are matched against the kernel `comm` (like `pkill -x`,
+  truncated to 15 bytes). A systemd unit with `Restart=always` will respawn
+  after each kill — such services need unit-level stopping, which reptile
+  intentionally does not do.
+- `probe_url` defaults to Cloudflare's `cdn-cgi/trace` because it is HTTPS to
+  a **literal IP** (no DNS dependency inside the tunnel) and returns
+  `loc=<country>` / `ip=<exit ip>`. Any service works — point `probe_url`
+  elsewhere and adapt the two regexes, e.g. for
+  [ipwho.is](https://ipwho.is): `"country_pattern":
+  "\"country_code\"\\s*:\\s*\"([A-Za-z]{2})\"`,
+  `"ip_pattern": "\"ip\"\\s*:\\s*\"([^\"]+)\""`. Hostname probe URLs resolve
+  DNS **through the tunnel** — add `DNS = …` to your wg-quick config or use a
+  literal-IP service.
+- `dnsbl_zones`: a hit is an A answer in `127.0.0.0/8` (operator refusal
+  codes `127.255.255.x` are correctly ignored). `zen.spamhaus.org` returns
+  refusal codes when queried via public resolvers (8.8.8.8/1.1.1.1) — run a
+  local resolver or drop the zone. Set `[]` to disable reputation checks.
+- `extra_accept` is spliced verbatim into the output chain, e.g.
+  `"ip daddr 192.168.0.0/16 accept"` for LAN access while down.
+
+## WireGuard config recommendations
+
+In `/etc/wireguard/wg0.conf` `[Peer]`:
+
+```ini
+PersistentKeepalive = 25
+```
+
+Without periodic handshakes an idle-but-healthy tunnel looks stale and gets
+killed as a false positive. Either set keepalive or point `ping_target` at an
+IP inside the tunnel (it is pinged once per poll to force fresh handshakes).
+
+The firewall derives the allowed transport ports from the `Endpoint =`
+lines of `wg_conf` at unit start — after changing endpoints run
+`systemctl restart reptile-firewall`.
+
+## Agent mode
+
+While `standby` runs, it serves newline-JSON on the unix socket:
+
+```
+-> {"cmd":"status"}    <- {"ok":true,"status":{"state":"up","streak":0,
+                            "exit_ip":"198.51.100.7","country":"CH",
+                            "updated_at":"2026-08-29T07:00:00Z"}}
+-> {"cmd":"probe"}     <- same shape, after a fresh tunnel+egress evaluation
+```
+
+`reptile status` / `reptile status -probe` are thin clients. The watchdog
+publishes every poll verdict (state, streak, failure reason, observed exit)
+to the socket, so an agent can watch safety in real time.
+
+## Logging
+
+Records go to stderr (journald-friendly, no duplicate timestamp — level
+padded, `key=value` attrs) and, when `log_file` is set, to the file sink
+(always timestamped, 0600). Steady state is silent; you get:
+
+```
+INFO  tunnel possibly DOWN (1/2): handshake 999s old (max 180s)
+WARN  sent SIGTERM comm=torrentd pid=1234
+INFO  tunnel DOWN - killing targets: egress country DE != expected CH
+WARN  egress check failed reason="probe request failed" observed_country=DE observed_ip=198.51.100.8
+INFO  egress verified country=CH ip=198.51.100.7
+INFO  heartbeat: state=up streak=0 exit_ip=198.51.100.7 country=CH
+INFO  tunnel UP
+```
+
+`reptile history` reads the file (also after the daemon stopped);
+`journalctl -u reptile -f` covers the console sink. No rotation — hook up
+logrotate if the heartbeat volume bothers you.
+
+## Systemd units
+
+- `reptile.service` — the watchdog; `Restart=on-failure`, deliberately **not**
+  bound to `wg-quick@wg0` (it must keep killing while the tunnel is down).
+  Hardened: `ProtectSystem=strict`, `NoNewPrivileges`,
+  `CapabilityBoundingSet=CAP_KILL CAP_NET_ADMIN CAP_NET_RAW`,
+  `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK`.
+- `reptile-firewall.service` — oneshot, `DefaultDependencies=no`,
+  ordered after `network-pre.target`; engages the nftables kill switch at
+  boot, removes its table on stop.
+
+## Operational check
+
+After installing, verify the whole chain once:
+
+```sh
+reptile check                      # tunnel UP + egress proven
+sudo wg-quick down wg0             # deliberate outage
+# within ~2 polls: journal shows "tunnel DOWN - killing targets",
+# targets die, `reptile status` exits 1, non-tunnel egress is dropped
+sudo wg-quick up wg0
+reptile status                     # state=up again (killed targets stay dead)
+```
+
+## Development
+
+```sh
+go build ./cmd/reptile        # local build
+go test -race ./...           # full suite (store, socket, egress, killer with
+                              #   real processes, firewall rulesets, config)
+GOOS=linux GOARCH=amd64 go build -o dist/reptile-linux-amd64 ./cmd/reptile
+GOOS=linux GOARCH=arm64 go build -o dist/reptile-linux-arm64 ./cmd/reptile
+```
+
+CI (`.github/workflows/ci.yml`) runs gofmt, `go vet`, race tests, the cross
+build matrix, and `govulncheck` on every push to `main` and every PR.
+Actions are `actions/checkout@v7` / `actions/setup-go@v6`, least-privilege
+(`contents: read`, `persist-credentials: false`).
+
+Layout: `cmd/reptile` is a thin entry point; everything lives in
+`internal/app` (config, tunnel, egress, killer, watchdog, firewall, agent,
+logging, install). External commands (`wg`, `ip`, `ping`, `nft`,
+`systemctl`) are invoked through injectable runners — that is what makes the
+kill logic testable off-Linux.
+
+## Known limitations
+
+- Linux-only at runtime (the `/proc` scanner and `SO_BINDTODEVICE` dialer
+  are Linux-specific; the suite runs anywhere, the daemon targets Linux).
+- Killing cannot stop systemd services that auto-restart (see `targets`).
+- `expected_country` is a single-country allowlist, not a denylist — that is
+  strictly stronger than any country blacklist.
+- No config hot reload; edit and `systemctl restart reptile`.
+- Log file has no rotation.
+- macOS can build and test the logic, but `install`'s systemctl activation
+  and the units themselves are only exercised on a real Linux host — run the
+  operational check above before trusting it in anger.
+
+## License
+
+MIT.

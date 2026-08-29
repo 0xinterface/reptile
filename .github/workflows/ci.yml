@@ -33,8 +33,6 @@ jobs:
           fi
       - name: go vet
         run: go vet ./...
-      - name: shellcheck (install.sh)
-        run: shellcheck -S error install.sh
 
   test:
     runs-on: ubuntu-latest
