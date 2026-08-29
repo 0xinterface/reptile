@@ -65,8 +65,15 @@ jobs:
           go-version-file: go.mod
       - name: build reptile
         run: |
-          go build -trimpath -ldflags='-s -w' \
+          build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          go build -trimpath -ldflags="-s -w \
+            -X github.com/0xinterface/reptile/internal/app.version=${GITHUB_REF_NAME} \
+            -X github.com/0xinterface/reptile/internal/app.commit=${GITHUB_SHA} \
+            -X github.com/0xinterface/reptile/internal/app.buildDate=${build_date}" \
             -o dist/reptile-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/reptile
+      - name: version output smoke
+        if: matrix.goarch == 'amd64'
+        run: ./dist/reptile-${{ matrix.goos }}-${{ matrix.goarch }} version
       - name: verify binary
         run: |
           test -x dist/reptile-${{ matrix.goos }}-${{ matrix.goarch }}

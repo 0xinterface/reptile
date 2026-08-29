@@ -38,15 +38,18 @@ func Run() {
 	// so the handler omits its own clock; interactively it adds short time.
 	slog.SetDefault(slog.New(NewConsoleHandler(os.Stderr, stderrIsTTY())))
 
-	// install must run WITHOUT a config file: on a fresh host it creates
-	// the one every other subcommand needs.
+	// install and version must run WITHOUT a config file: install creates
+	// the one every other subcommand needs, version is metadata-only.
 	sub := flag.Args()
 	subCmd, subArgs := "", []string(nil)
 	if len(sub) > 0 {
 		subCmd, subArgs = sub[0], sub[1:]
 	}
-	if subCmd == "install" {
+	switch subCmd {
+	case "install":
 		os.Exit(runInstall(subArgs))
+	case "version":
+		os.Exit(runVersion())
 	}
 
 	cfg, err := LoadConfig(*configPath)
@@ -73,7 +76,7 @@ func Run() {
 	case "firewall":
 		runFirewall(cfg, flag.Arg(1))
 	default:
-		fatal("usage: reptile [-config path] [-interface wg0] standby|status|history|config [set]|check|install|firewall up|down")
+		fatal("usage: reptile [-config path] [-interface wg0] standby|status|history|config [set]|check|install|version|firewall up|down")
 	}
 }
 
@@ -230,6 +233,9 @@ func makeReloader(configPath string, live *Live, tc *TunnelChecker, eg *EgressCh
 	return func() ([]string, []string, error) {
 		newCfg, err := LoadConfig(configPath)
 		if err != nil {
+			return nil, nil, err
+		}
+		if err := newCfg.Validate(); err != nil {
 			return nil, nil, err
 		}
 		if err := eg.Apply(newCfg); err != nil {

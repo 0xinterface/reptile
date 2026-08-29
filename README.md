@@ -219,6 +219,18 @@ GOOS=linux GOARCH=amd64 go build -o dist/reptile-linux-amd64 ./cmd/reptile
 GOOS=linux GOARCH=arm64 go build -o dist/reptile-linux-arm64 ./cmd/reptile
 ```
 
+### Build metadata
+
+`reptile version` prints version, commit, build date, OS/arch and Go
+toolchain. Stamping precedence:
+
+1. `-ldflags` `-X` values — CI stamps `version` (ref name), `commit` (SHA)
+   and `buildDate` on every build.
+2. Without ldflags, the Go toolchain's embedded VCS info is used:
+   `go install`/`go build` from a git checkout automatically carries the
+   module version (tag or pseudo-version), the commit revision and the
+   commit time. Untagged installs show a `v0.0.0-…` pseudo-version; tag
+   releases (`git tag v0.1.0 && git push --tags`) for clean versions.
 CI (`.github/workflows/ci.yml`) runs gofmt, `go vet`, race tests, the cross
 build matrix, and `govulncheck` on every push to `main` and every PR.
 Actions are `actions/checkout@v7` / `actions/setup-go@v6`, least-privilege
