@@ -241,7 +241,7 @@ Config: `.goreleaser.yaml`. CI validates it on every PR
 ```sh
 go build ./cmd/reptile        # local build
 go test -race ./...           # portable unit/behavior suite
-sudo env "PATH=$PATH" REPTILE_REQUIRE_INTEGRATION=1 \
+sudo env "PATH=/usr/sbin:$PATH" REPTILE_REQUIRE_INTEGRATION=1 \
   go test -tags=integration -count=1 \
   -run 'Test(FirewallNamespace|InstalledSystemdSandbox)$' ./internal/app
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o dist/reptile-linux-amd64 ./cmd/reptile

@@ -59,7 +59,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y nftables iproute2
       - name: privileged Linux integration tests
         run: |
-          sudo env "PATH=$PATH" REPTILE_REQUIRE_INTEGRATION=1 \
+          sudo env "PATH=/usr/sbin:$PATH" REPTILE_REQUIRE_INTEGRATION=1 \
             go test -tags=integration -count=1 \
             -run 'Test(FirewallNamespace|InstalledSystemdSandbox)$' ./internal/app
 

@@ -29,6 +29,12 @@ var firewallReloadKeys = map[string]bool{
 	"extra_accept": true,
 }
 
+func configureLogging() {
+	// Under journald stderr is a pipe and the journal timestamps every line,
+	// so the handler omits its own clock; interactively it adds short time.
+	slog.SetDefault(slog.New(NewConsoleHandler(os.Stderr, stderrIsTTY())))
+}
+
 func Run() {
 	var (
 		configPath = flag.String("config", defaultConfigPath, "path to config.json")
@@ -36,9 +42,7 @@ func Run() {
 	)
 	flag.Parse()
 
-	// Under journald stderr is a pipe and the journal timestamps every line,
-	// so the handler omits its own clock; interactively it adds short time.
-	slog.SetDefault(slog.New(NewConsoleHandler(os.Stderr, stderrIsTTY())))
+	configureLogging()
 
 	// install and version must run WITHOUT a config file: install creates
 	// the one every other subcommand needs, version is metadata-only.

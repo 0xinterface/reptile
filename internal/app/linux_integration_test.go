@@ -5,6 +5,7 @@ package app
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -156,21 +157,31 @@ func runUDPEchoServer() {
 }
 
 func runUDPClient(address string) {
-	conn, err := net.DialTimeout("udp4", address, 300*time.Millisecond)
+	remote, err := net.ResolveUDPAddr("udp4", address)
 	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
+	}
+	conn, err := net.DialUDP("udp4", nil, remote)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(3)
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(300 * time.Millisecond))
 	if _, err := conn.Write([]byte("proof")); err != nil {
-		os.Exit(2)
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(3)
 	}
 	buf := make([]byte, 16)
-	if _, err := conn.Read(buf); err != nil {
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			os.Exit(3)
-		}
-		os.Exit(2)
+	n, err := conn.Read(buf)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(3)
+	}
+	if string(buf[:n]) != "proof" {
+		fmt.Fprintf(os.Stderr, "unexpected echo %q\n", buf[:n])
+		os.Exit(4)
 	}
 }
 
@@ -183,7 +194,11 @@ func runNetnsUDPClient(namespace, address string) error {
 		"REPTILE_NETNS_HELPER=client",
 		"REPTILE_NETNS_ADDRESS="+address,
 	)
-	return cmd.Run()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 func TestInstalledSystemdSandbox(t *testing.T) {
@@ -195,6 +210,7 @@ func TestInstalledSystemdSandbox(t *testing.T) {
 		if err := cfg.Validate(); err != nil {
 			t.Fatal(err)
 		}
+		configureLogging()
 		runDaemon(cfg, os.Getenv("REPTILE_SYSTEMD_CONFIG"))
 		return
 	}
@@ -254,8 +270,9 @@ func TestInstalledSystemdSandbox(t *testing.T) {
 
 	args := []string{
 		"--unit=" + unit,
-		"--collect",
 		"--property=Type=simple",
+		"--property=RemainAfterExit=yes",
+		"--property=TimeoutStopSec=5s",
 		"--property=NoNewPrivileges=yes",
 		"--property=ProtectSystem=strict",
 		"--property=ProtectHome=yes",
@@ -275,8 +292,12 @@ func TestInstalledSystemdSandbox(t *testing.T) {
 	if out, err := exec.Command("systemd-run", args...).CombinedOutput(); err != nil {
 		t.Fatalf("systemd-run: %v\n%s", err, out)
 	}
+	stopped := false
 	t.Cleanup(func() {
-		_ = exec.Command("systemctl", "stop", unit).Run()
+		if !stopped {
+			_ = exec.Command("systemctl", "stop", unit).Run()
+		}
+		_ = exec.Command("systemctl", "reset-failed", unit).Run()
 	})
 
 	deadline := time.Now().Add(5 * time.Second)
@@ -294,17 +315,43 @@ func TestInstalledSystemdSandbox(t *testing.T) {
 		journal, _ := exec.Command("journalctl", "-u", unit, "--no-pager", "-n", "50").CombinedOutput()
 		t.Fatalf("sandboxed daemon did not serve its socket: %v\n%s", queryErr, journal)
 	}
-	logBody, err := os.ReadFile(logPath)
+	var logBody []byte
+	logDeadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(logDeadline) {
+		logBody, err = os.ReadFile(logPath)
+		if err == nil && strings.Contains(string(logBody), "watchdog started") {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	if err != nil {
 		t.Fatalf("sandboxed daemon did not create its state log: %v", err)
 	}
 	if !strings.Contains(string(logBody), "watchdog started") {
-		t.Fatalf("state log lacks startup event: %s", logBody)
+		t.Fatalf("state log lacks startup event after readiness wait: %s", logBody)
 	}
 	if info, err := os.Stat(socketPath); err != nil || info.Mode().Perm() != 0o600 {
 		t.Fatalf("socket mode = %v, err=%v; want 0600", info, err)
 	}
 	if output := runCommand(t, "systemctl", "is-active", unit); strings.TrimSpace(output) != "active" {
 		t.Fatalf("unit state = %q, want active", output)
+	}
+	if out, err := exec.Command("systemctl", "stop", unit).CombinedOutput(); err != nil {
+		t.Fatalf("sandboxed daemon did not stop cleanly: %v\n%s", err, out)
+	}
+	stopped = true
+	result := runCommand(
+		t,
+		"systemctl",
+		"show",
+		"--property=Result",
+		"--property=ExecMainCode",
+		"--property=ExecMainStatus",
+		unit,
+	)
+	for _, want := range []string{"Result=success", "ExecMainStatus=0"} {
+		if !strings.Contains(result, want) {
+			t.Fatalf("unclean daemon shutdown (%s missing):\n%s", want, result)
+		}
 	}
 }
