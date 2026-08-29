@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"os/exec"
 	"strings"
 	"syscall"
@@ -166,5 +167,44 @@ func TestKillTargetsReportsSignalFailures(t *testing.T) {
 	}
 	if len(logged) != 2 || logged[0] == nil || logged[1] == nil {
 		t.Fatalf("logged errors = %v, want TERM and KILL failures", logged)
+	}
+}
+
+func TestSignalProcessesDispatchesConcurrently(t *testing.T) {
+	procs := make([]proc, 8)
+	for i := range procs {
+		procs[i] = proc{PID: 100 + i, Comm: "worker"}
+	}
+	started := make(chan int, len(procs))
+	release := make(chan struct{})
+	done := make(chan []error, 1)
+	go func() {
+		done <- signalProcesses(procs, syscall.SIGTERM, func(pid int, _ syscall.Signal) error {
+			started <- pid
+			<-release
+			if pid%2 == 0 {
+				return syscall.EPERM
+			}
+			return nil
+		})
+	}()
+
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for range procs {
+		select {
+		case <-started:
+		case <-deadline.C:
+			close(release)
+			t.Fatal("signals were not dispatched concurrently")
+		}
+	}
+	close(release)
+	errs := <-done
+	for i, err := range errs {
+		wantErr := procs[i].PID%2 == 0
+		if errors.Is(err, syscall.EPERM) != wantErr {
+			t.Errorf("pid %d error = %v, want EPERM=%v", procs[i].PID, err, wantErr)
+		}
 	}
 }

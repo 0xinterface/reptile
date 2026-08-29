@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -50,6 +51,43 @@ type killOptions struct {
 	Signal func(pid int, sig syscall.Signal) error
 	Grace  time.Duration
 	Log    func(event string, pid int, comm string, err error)
+}
+
+const maxSignalWorkers = 32
+
+// signalProcesses dispatches one signal per process with bounded concurrency.
+// The returned errors retain process order so logging remains deterministic.
+func signalProcesses(
+	procs []proc,
+	sig syscall.Signal,
+	signal func(pid int, sig syscall.Signal) error,
+) []error {
+	if len(procs) == 0 {
+		return []error{}
+	}
+	workers := len(procs)
+	if workers > maxSignalWorkers {
+		workers = maxSignalWorkers
+	}
+
+	errs := make([]error, len(procs))
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				errs[i] = signal(procs[i].PID, sig)
+			}
+		}()
+	}
+	for i := range procs {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	return errs
 }
 
 // killTargets signals every process whose comm exactly matches a target:
@@ -98,16 +136,16 @@ func killTargets(ctx context.Context, targets []string, opts killOptions) ([]str
 	sort.Strings(names)
 
 	var failures []error
-	send := func(event string, sig syscall.Signal, p proc) {
-		err := signal(p.PID, sig)
-		notify(event, p, err)
-		if err != nil && !errors.Is(err, syscall.ESRCH) {
-			failures = append(failures, fmt.Errorf("%s pid=%d comm=%q: %w", event, p.PID, p.Comm, err))
+	sendAll := func(event string, sig syscall.Signal, procs []proc) {
+		for i, err := range signalProcesses(procs, sig, signal) {
+			p := procs[i]
+			notify(event, p, err)
+			if err != nil && !errors.Is(err, syscall.ESRCH) {
+				failures = append(failures, fmt.Errorf("%s pid=%d comm=%q: %w", event, p.PID, p.Comm, err))
+			}
 		}
 	}
-	for _, p := range termPIDs {
-		send("SIGTERM", syscall.SIGTERM, p)
-	}
+	sendAll("SIGTERM", syscall.SIGTERM, termPIDs)
 
 	timer := time.NewTimer(opts.Grace)
 	defer timer.Stop()
@@ -122,10 +160,12 @@ func killTargets(ctx context.Context, targets []string, opts killOptions) ([]str
 		failures = append(failures, fmt.Errorf("re-list target processes: %w", err))
 		return names, errors.Join(failures...)
 	}
+	killPIDs := []proc{}
 	for _, p := range procs {
 		if want[p.Comm] {
-			send("SIGKILL", syscall.SIGKILL, p)
+			killPIDs = append(killPIDs, p)
 		}
 	}
+	sendAll("SIGKILL", syscall.SIGKILL, killPIDs)
 	return names, errors.Join(failures...)
 }
