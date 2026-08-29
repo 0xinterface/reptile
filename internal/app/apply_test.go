@@ -15,9 +15,10 @@ func TestEgressApplyChangesVerdict(t *testing.T) {
 		t.Fatalf("DE must fail against CH: %s", reason)
 	}
 
-	// hot-apply a complete config that expects DE
+	// hot-apply a complete config that expects DE. Interface stays empty:
+	// on Linux the probe dialer binds to it (SO_BINDTODEVICE) and a unit
+	// test must not depend on a host interface existing.
 	e.Apply(Config{
-		Interface:       "wg0",
 		ExpectedCountry: "DE",
 		CountryPattern:  `(?m)^loc=([A-Z]{2})$`,
 		IPPattern:       `(?m)^ip=(\S+)$`,
