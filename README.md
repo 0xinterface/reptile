@@ -231,6 +231,7 @@ toolchain. Stamping precedence:
    module version (tag or pseudo-version), the commit revision and the
    commit time. Untagged installs show a `v0.0.0-…` pseudo-version; tag
    releases (`git tag v0.1.0 && git push --tags`) for clean versions.
+
 CI (`.github/workflows/ci.yml`) runs gofmt, `go vet`, race tests, the cross
 build matrix, and `govulncheck` on every push to `main` and every PR.
 Actions are `actions/checkout@v7` / `actions/setup-go@v6`, least-privilege
