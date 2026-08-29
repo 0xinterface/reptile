@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"os/exec"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -50,16 +51,21 @@ func TestKillTargetsTermThenKillEscalation(t *testing.T) {
 		_ = syscall.Kill(stubborn.Process.Pid, 9)
 	}()
 
-	lister := fakeLister{procs: []proc{
-		{sleep1.Process.Pid, "sleep"},
-		{sleep2.Process.Pid, "sleep"},
-		{stubborn.Process.Pid, "sleep"},
-	}}
 	var events []string
-	killed := KillTargets(context.Background(), lister, []string{"sleep"}, 300*time.Millisecond,
-		func(event string, pid int, comm string) {
+	killed, err := killTargets(context.Background(), []string{"sleep"}, killOptions{
+		Lister: fakeLister{procs: []proc{
+			{sleep1.Process.Pid, "sleep"},
+			{sleep2.Process.Pid, "sleep"},
+			{stubborn.Process.Pid, "sleep"},
+		}},
+		Grace: 300 * time.Millisecond,
+		Log: func(event string, _ int, comm string, _ error) {
 			events = append(events, event+" "+comm)
-		})
+		},
+	})
+	if err != nil {
+		t.Fatalf("killTargets: %v", err)
+	}
 
 	if len(killed) != 1 || killed[0] != "sleep" {
 		t.Errorf("killed = %v, want [sleep]", killed)
@@ -88,8 +94,13 @@ func TestKillTargetsSparesNonTargets(t *testing.T) {
 	innocent := spawn(t, "sleep", "30")
 	defer func() { _ = syscall.Kill(innocent.Process.Pid, 9) }()
 
-	lister := fakeLister{procs: []proc{{innocent.Process.Pid, "otherproc"}}}
-	killed := KillTargets(context.Background(), lister, []string{"sleep"}, 100*time.Millisecond, nil)
+	killed, err := killTargets(context.Background(), []string{"sleep"}, killOptions{
+		Lister: fakeLister{procs: []proc{{innocent.Process.Pid, "otherproc"}}},
+		Grace:  100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("killTargets: %v", err)
+	}
 	if len(killed) != 0 {
 		t.Errorf("killed = %v, want none", killed)
 	}
@@ -97,9 +108,14 @@ func TestKillTargetsSparesNonTargets(t *testing.T) {
 }
 
 func TestKillTargetsNoMatchSkipsGrace(t *testing.T) {
-	lister := fakeLister{procs: []proc{{1, "init-like"}}}
 	start := time.Now()
-	killed := KillTargets(context.Background(), lister, []string{"sleep"}, 2*time.Second, nil)
+	killed, err := killTargets(context.Background(), []string{"sleep"}, killOptions{
+		Lister: fakeLister{procs: []proc{{1, "init-like"}}},
+		Grace:  2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("killTargets: %v", err)
+	}
 	if len(killed) != 0 {
 		t.Errorf("killed = %v, want none", killed)
 	}
@@ -115,14 +131,40 @@ func TestKillTargetsMultipleTargets(t *testing.T) {
 		_ = syscall.Kill(a.Process.Pid, 9)
 		_ = syscall.Kill(b.Process.Pid, 9)
 	}()
-	lister := fakeLister{procs: []proc{
-		{a.Process.Pid, "torrentd"},
-		{b.Process.Pid, "syncd"},
-	}}
-	killed := KillTargets(context.Background(), lister, []string{"torrentd", "syncd"}, 200*time.Millisecond, nil)
+	killed, err := killTargets(context.Background(), []string{"torrentd", "syncd"}, killOptions{
+		Lister: fakeLister{procs: []proc{
+			{a.Process.Pid, "torrentd"},
+			{b.Process.Pid, "syncd"},
+		}},
+		Grace: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("killTargets: %v", err)
+	}
 	if len(killed) != 2 {
 		t.Errorf("killed = %v, want both targets", killed)
 	}
 	waitExit(t, a, 5*time.Second, true)
 	waitExit(t, b, 5*time.Second, true)
+}
+
+func TestKillTargetsReportsSignalFailures(t *testing.T) {
+	var logged []error
+	killed, err := killTargets(context.Background(), []string{"torrentd"}, killOptions{
+		Lister: fakeLister{procs: []proc{{PID: 123, Comm: "torrentd"}}},
+		Signal: func(int, syscall.Signal) error { return syscall.EPERM },
+		Grace:  0,
+		Log: func(_ string, _ int, _ string, err error) {
+			logged = append(logged, err)
+		},
+	})
+	if len(killed) != 1 || killed[0] != "torrentd" {
+		t.Fatalf("killed = %v, want [torrentd]", killed)
+	}
+	if err == nil || !strings.Contains(err.Error(), "operation not permitted") {
+		t.Fatalf("error = %v, want signal failure", err)
+	}
+	if len(logged) != 2 || logged[0] == nil || logged[1] == nil {
+		t.Fatalf("logged errors = %v, want TERM and KILL failures", logged)
+	}
 }

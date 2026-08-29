@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"regexp"
@@ -32,6 +33,53 @@ var levelColor = map[string]string{
 }
 
 var timeRe = regexp.MustCompile(`^\d{2}:\d{2}:\d{2}$`)
+
+const maxHistoryEntries = 100_000
+
+// ReadRecentEvents streams a log and retains only the last n entries at or
+// above min. Memory use is bounded independently of the log file size.
+func ReadRecentEvents(r io.Reader, min, n int) ([]Entry, error) {
+	if n < 0 || n > maxHistoryEntries {
+		return nil, fmt.Errorf("history count must be between 0 and %d", maxHistoryEntries)
+	}
+	if n == 0 {
+		return []Entry{}, nil
+	}
+
+	ring := make([]Entry, n)
+	seen := 0
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	for sc.Scan() {
+		entry, ok := parseEvent(sc.Text())
+		if !ok || entry.Rank < min {
+			continue
+		}
+		ring[seen%n] = entry
+		seen++
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("read history: %w", err)
+	}
+
+	count := minInt(seen, n)
+	out := make([]Entry, count)
+	start := 0
+	if seen > n {
+		start = seen % n
+	}
+	for i := range count {
+		out[i] = ring[(start+i)%n]
+	}
+	return out, nil
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
 
 // ParseEvents parses log file lines (the file handler's output format),
 // dropping lines that are not events.

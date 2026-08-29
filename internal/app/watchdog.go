@@ -57,12 +57,18 @@ func runWatchdog(ctx context.Context, live *Live, tunnel func() (bool, string), 
 	pollDur := d.poll
 	ticker := time.NewTicker(pollDur)
 	defer ticker.Stop()
+	heartbeatDur := d.heartbeat
+	var heartbeat *time.Ticker
 	var heartbeatC <-chan time.Time
-	if d.heartbeat > 0 {
-		hb := time.NewTicker(d.heartbeat)
-		defer hb.Stop()
-		heartbeatC = hb.C
+	if heartbeatDur > 0 {
+		heartbeat = time.NewTicker(heartbeatDur)
+		heartbeatC = heartbeat.C
 	}
+	defer func() {
+		if heartbeat != nil {
+			heartbeat.Stop()
+		}
+	}()
 
 	state := wdState{}
 	for {
@@ -79,12 +85,27 @@ func runWatchdog(ctx context.Context, live *Live, tunnel func() (bool, string), 
 		}
 
 		cfg := live.Get()
-		if d, err := cfg.Durations(); err != nil {
+		nextDurations, err := cfg.Durations()
+		if err != nil {
 			logf(fmt.Sprintf("config invalid, keeping previous settings: %v", err))
-		} else if d.poll != pollDur {
-			pollDur = d.poll
-			ticker.Reset(pollDur)
-			logf(fmt.Sprintf("poll_interval applied: %s", pollDur))
+		} else {
+			if nextDurations.poll != pollDur {
+				pollDur = nextDurations.poll
+				ticker.Reset(pollDur)
+				logf(fmt.Sprintf("poll_interval applied: %s", pollDur))
+			}
+			if nextDurations.heartbeat != heartbeatDur {
+				if heartbeat != nil {
+					heartbeat.Stop()
+				}
+				heartbeatDur = nextDurations.heartbeat
+				heartbeat, heartbeatC = nil, nil
+				if heartbeatDur > 0 {
+					heartbeat = time.NewTicker(heartbeatDur)
+					heartbeatC = heartbeat.C
+				}
+				logf(fmt.Sprintf("heartbeat_interval applied: %s", heartbeatDur))
+			}
 		}
 
 		tOK, tReason := tunnel()

@@ -11,9 +11,9 @@ Two independent layers:
    condition fails, repeatedly `SIGTERM`/`SIGKILL`s your target processes
    (so processes started mid-outage die too).
 2. **nftables kill switch** (`firewall up`) — always-on egress policy:
-   everything leaves the host **only** via the tunnel, except the WireGuard
-   transport ports (so it can reconnect), loopback, and DHCP. Leaks are
-   structurally impossible even before the watchdog reacts.
+   everything leaves the host **only** via the tunnel, except exact literal
+   WireGuard endpoint address/port pairs, loopback, DHCP, required IPv6
+   neighbor discovery, and explicitly configured `extra_accept` rules.
 
 ## Why "interface is up" is not enough
 
@@ -40,6 +40,7 @@ Install, set `expected_country` and `targets`, enable two units — done.
 ## Requirements
 
 - Linux (systemd), WireGuard via `wg-quick` (`/etc/wireguard/<iface>.conf`)
+- literal-IP WireGuard `Endpoint` values when the firewall is enabled
 - root (the daemon needs `CAP_KILL`, `CAP_NET_ADMIN`, `CAP_NET_RAW`)
 - `wg`, `nft`, `curl` on PATH
 
@@ -75,13 +76,16 @@ run `sudo ./reptile install`.
 | `reptile standby` | run the watchdog daemon (agent socket + log file tee). `daemon` is an alias. |
 | `reptile status [-probe]` | query the running daemon over its socket; `-probe` forces a fresh egress evaluation. Exit 1 when down. |
 | `reptile history [-n N] [-level info\|warn\|error] [--no-color]` | recent events from the log file with level highlighting; works while the daemon is down |
+| `reptile config [set key value ...]` | show effective config or atomically validate, save, and hot-apply safe settings |
 | `reptile check` | one-shot evaluation of every configured condition; exit 0 = proven safe |
 | `reptile install [flags]` | see above |
 | `reptile firewall up\|down` | engage/remove the nftables kill switch (normally managed by its unit) |
 
 ## Configuration
 
-`/etc/reptile/config.json` — JSON over defaults; absent keys keep defaults.
+`/etc/reptile/config.json` — strict JSON over defaults; absent keys keep
+defaults, while unknown keys and trailing JSON are rejected. The complete
+configuration is semantically validated before start, reload, or `config set`.
 Path defaults: config `/etc/reptile/config.json`, socket
 `/run/reptile/agent.sock`, log `/var/lib/reptile/events.log`.
 
@@ -101,7 +105,7 @@ Path defaults: config `/etc/reptile/config.json`, socket
   "probe_url": "https://1.1.1.1/cdn-cgi/trace",
   "country_pattern": "(?m)^loc=([A-Z]{2})",
   "ip_pattern": "(?m)^ip=([0-9a-fA-F.:]+)",
-  "probe_interval": "300s",      // egress verdict cache TTL
+  "probe_interval": "300s",      // cache TTL; invalidated on tunnel failure
   "probe_timeout": "5s",
   "dnsbl_zones": ["zen.spamhaus.org", "b.barracudacentral.org", "bl.spamcop.net"],
   "targets": ["transmission-daemon"],  // exact comm names, 15-char limit
@@ -111,6 +115,12 @@ Path defaults: config `/etc/reptile/config.json`, socket
   "log_file": "/var/lib/reptile/events.log"  // "" disables the file sink
 }
 ```
+
+`reptile config set` persists only a completely valid result. Safe daemon
+settings are applied live. Changes to `interface`, `socket_path`, or
+`log_file` report `systemctl restart reptile`; changes to `interface`,
+`wg_conf`, or `extra_accept` report
+`systemctl reload reptile-firewall`.
 
 Notes:
 
@@ -146,9 +156,11 @@ Without periodic handshakes an idle-but-healthy tunnel looks stale and gets
 killed as a false positive. Either set keepalive or point `ping_target` at an
 IP inside the tunnel (it is pinged once per poll to force fresh handshakes).
 
-The firewall derives the allowed transport ports from the `Endpoint =`
-lines of `wg_conf` at unit start — after changing endpoints run
-`systemctl restart reptile-firewall`.
+The firewall derives exact allowed transport address/port pairs from the
+`Endpoint =` lines of `wg_conf` at unit start. Endpoints must use literal IPv4
+or IPv6 addresses; hostnames are rejected rather than opening a port to every
+destination. After changing endpoints run
+`systemctl reload reptile-firewall`.
 
 ## Agent mode
 
@@ -164,6 +176,7 @@ While `standby` runs, it serves newline-JSON on the unix socket:
 `reptile status` / `reptile status -probe` are thin clients. The watchdog
 publishes every poll verdict (state, streak, failure reason, observed exit)
 to the socket, so an agent can watch safety in real time.
+The socket is mode `0600`; requests have deadlines and bounded concurrency.
 
 ## Logging
 
@@ -189,8 +202,10 @@ logrotate if the heartbeat volume bothers you.
 
 - `reptile.service` — the watchdog; `Restart=on-failure`, deliberately **not**
   bound to `wg-quick@wg0` (it must keep killing while the tunnel is down).
-  Hardened: `ProtectSystem=strict`, `NoNewPrivileges`,
-  `CapabilityBoundingSet=CAP_KILL CAP_NET_ADMIN CAP_NET_RAW`,
+  `RuntimeDirectory=reptile` and `StateDirectory=reptile` provide narrowly
+  writable paths inside `ProtectSystem=strict`. Other hardening includes
+  `NoNewPrivileges`, `UMask=0077`,
+  `CapabilityBoundingSet=CAP_KILL CAP_NET_ADMIN CAP_NET_RAW`, and
   `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK`.
 - `reptile-firewall.service` — oneshot, `DefaultDependencies=no`,
   ordered after `network-pre.target`; engages the nftables kill switch at
@@ -225,10 +240,12 @@ Config: `.goreleaser.yaml`. CI validates it on every PR
 
 ```sh
 go build ./cmd/reptile        # local build
-go test -race ./...           # full suite (store, socket, egress, killer with
-                              #   real processes, firewall rulesets, config)
-GOOS=linux GOARCH=amd64 go build -o dist/reptile-linux-amd64 ./cmd/reptile
-GOOS=linux GOARCH=arm64 go build -o dist/reptile-linux-arm64 ./cmd/reptile
+go test -race ./...           # portable unit/behavior suite
+sudo env "PATH=$PATH" REPTILE_REQUIRE_INTEGRATION=1 \
+  go test -tags=integration -count=1 \
+  -run 'Test(FirewallNamespace|InstalledSystemdSandbox)$' ./internal/app
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o dist/reptile-linux-amd64 ./cmd/reptile
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o dist/reptile-linux-arm64 ./cmd/reptile
 ```
 
 ### Build metadata
@@ -244,10 +261,10 @@ toolchain. Stamping precedence:
    commit time. Untagged installs show a `v0.0.0-…` pseudo-version; tag
    releases (`git tag v0.1.0 && git push --tags`) for clean versions.
 
-CI (`.github/workflows/ci.yml`) runs gofmt, `go vet`, race tests, the cross
-build matrix, and `govulncheck` on every push to `main` and every PR.
-Actions are `actions/checkout@v7` / `actions/setup-go@v6`, least-privilege
-(`contents: read`, `persist-credentials: false`).
+CI (`.github/workflows/ci.yml`) runs gofmt, `go vet`, race tests, privileged
+nftables/systemd integration tests, an architecture-verified cross-build
+matrix, and `govulncheck` on every push to `main` and every PR. Actions are
+least-privilege (`contents: read`, `persist-credentials: false`).
 
 Layout: `cmd/reptile` is a thin entry point; everything lives in
 `internal/app` (config, tunnel, egress, killer, watchdog, firewall, agent,
@@ -262,11 +279,14 @@ kill logic testable off-Linux.
 - Killing cannot stop systemd services that auto-restart (see `targets`).
 - `expected_country` is a single-country allowlist, not a denylist — that is
   strictly stronger than any country blacklist.
-- No config hot reload; edit and `systemctl restart reptile`.
+- Config changes hot-apply when safe. Interface, socket, and log wiring need a
+  watchdog restart; interface, WireGuard config, and extra firewall accepts
+  need a firewall reload. The CLI reports the exact service command.
+- The fail-closed firewall requires literal-IP WireGuard endpoints; hostname
+  endpoints are rejected.
 - Log file has no rotation.
-- macOS can build and test the logic, but `install`'s systemctl activation
-  and the units themselves are only exercised on a real Linux host — run the
-  operational check above before trusting it in anger.
+- Privileged Linux CI exercises the real nftables policy in network namespaces
+  and starts the daemon inside its systemd filesystem sandbox.
 
 ## License
 

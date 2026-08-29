@@ -63,3 +63,28 @@ func TestHistoryRenderColorsLevelOnly(t *testing.T) {
 		t.Errorf("plain render = %q", plain.String())
 	}
 }
+
+func TestReadRecentEventsStreamsFilteredTail(t *testing.T) {
+	input := strings.Join([]string{
+		"15:04:01 INFO first",
+		"15:04:02 WARN second",
+		"malformed",
+		"15:04:03 ERROR third",
+		"15:04:04 WARN fourth",
+	}, "\n")
+	entries, err := ReadRecentEvents(strings.NewReader(input), RankWarn, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || entries[0].Rest != "third" || entries[1].Rest != "fourth" {
+		t.Fatalf("entries = %+v, want last two warn-or-higher events", entries)
+	}
+}
+
+func TestReadRecentEventsRejectsUnsafeCounts(t *testing.T) {
+	for _, n := range []int{-1, maxHistoryEntries + 1} {
+		if _, err := ReadRecentEvents(strings.NewReader(""), RankInfo, n); err == nil {
+			t.Errorf("count %d accepted", n)
+		}
+	}
+}

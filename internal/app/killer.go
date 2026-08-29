@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"sort"
 	"strconv"
@@ -43,28 +45,42 @@ func (procLister) List() ([]proc, error) {
 	return out, nil
 }
 
-// KillTargets signals every process whose comm exactly matches a target:
-// SIGTERM first, then SIGKILL to survivors after grace. Returns the target
-// names that had matches (sorted). Intended to be called every poll while
-// the tunnel is unsafe, which also reaps processes spawned mid-outage.
-func KillTargets(ctx context.Context, lister ProcLister, targets []string, grace time.Duration, logKill func(event string, pid int, comm string)) []string {
-	want := make(map[string]bool, len(targets))
-	for _, t := range targets {
-		want[t] = true
+type killOptions struct {
+	Lister ProcLister
+	Signal func(pid int, sig syscall.Signal) error
+	Grace  time.Duration
+	Log    func(event string, pid int, comm string, err error)
+}
+
+// killTargets signals every process whose comm exactly matches a target:
+// SIGTERM first, then SIGKILL to matching survivors and replacements after
+// grace. It returns every target name matched and all enforcement failures.
+func killTargets(ctx context.Context, targets []string, opts killOptions) ([]string, error) {
+	lister := opts.Lister
+	if lister == nil {
+		lister = procLister{}
 	}
-	notify := func(event string, pid int, comm string) {
-		if logKill != nil {
-			logKill(event, pid, comm)
+	signal := opts.Signal
+	if signal == nil {
+		signal = syscall.Kill
+	}
+	notify := func(event string, p proc, err error) {
+		if opts.Log != nil {
+			opts.Log(event, p.PID, p.Comm, err)
 		}
+	}
+
+	want := make(map[string]bool, len(targets))
+	for _, target := range targets {
+		want[target] = true
 	}
 	procs, err := lister.List()
 	if err != nil {
-		notify("list_failed", 0, "")
-		return nil
+		return nil, fmt.Errorf("list target processes: %w", err)
 	}
 
 	matched := map[string]bool{}
-	var termPIDs []proc
+	termPIDs := []proc{}
 	for _, p := range procs {
 		if want[p.Comm] {
 			matched[p.Comm] = true
@@ -72,33 +88,44 @@ func KillTargets(ctx context.Context, lister ProcLister, targets []string, grace
 		}
 	}
 	if len(termPIDs) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	names := make([]string, 0, len(matched))
-	for n := range matched {
-		names = append(names, n)
+	for name := range matched {
+		names = append(names, name)
 	}
 	sort.Strings(names)
 
-	for _, p := range termPIDs {
-		notify("SIGTERM", p.PID, p.Comm)
-		_ = syscall.Kill(p.PID, syscall.SIGTERM)
-	}
-
-	select {
-	case <-time.After(grace):
-	case <-ctx.Done():
-		return names
-	}
-
-	if procs2, err := lister.List(); err == nil {
-		for _, p := range procs2 {
-			if want[p.Comm] {
-				notify("SIGKILL", p.PID, p.Comm)
-				_ = syscall.Kill(p.PID, syscall.SIGKILL)
-			}
+	var failures []error
+	send := func(event string, sig syscall.Signal, p proc) {
+		err := signal(p.PID, sig)
+		notify(event, p, err)
+		if err != nil && !errors.Is(err, syscall.ESRCH) {
+			failures = append(failures, fmt.Errorf("%s pid=%d comm=%q: %w", event, p.PID, p.Comm, err))
 		}
 	}
-	return names
+	for _, p := range termPIDs {
+		send("SIGTERM", syscall.SIGTERM, p)
+	}
+
+	timer := time.NewTimer(opts.Grace)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+		return names, errors.Join(failures...)
+	}
+
+	procs, err = lister.List()
+	if err != nil {
+		failures = append(failures, fmt.Errorf("re-list target processes: %w", err))
+		return names, errors.Join(failures...)
+	}
+	for _, p := range procs {
+		if want[p.Comm] {
+			send("SIGKILL", syscall.SIGKILL, p)
+		}
+	}
+	return names, errors.Join(failures...)
 }

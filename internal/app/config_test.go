@@ -192,3 +192,55 @@ func TestConfigHeartbeatDuration(t *testing.T) {
 		t.Error("invalid heartbeat_interval accepted")
 	}
 }
+
+func TestLoadConfigRejectsUnknownAndTrailingJSON(t *testing.T) {
+	for name, body := range map[string]string{
+		"unknown field":  `{"interfce":"wg0"}`,
+		"trailing value": `{} {}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.json")
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadConfig(path); err == nil {
+				t.Fatalf("LoadConfig accepted %s", name)
+			}
+		})
+	}
+}
+
+func TestConfigValidateSemanticBounds(t *testing.T) {
+	valid := func() Config {
+		cfg := Defaults()
+		cfg.Targets = []string{"worker"}
+		cfg.ExpectedCountry = "CH"
+		return cfg
+	}
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{name: "empty interface", mutate: func(c *Config) { c.Interface = "" }},
+		{name: "long target", mutate: func(c *Config) { c.Targets = []string{"1234567890123456"} }},
+		{name: "duplicate target", mutate: func(c *Config) { c.Targets = []string{"worker", "worker"} }},
+		{name: "bad expected IP", mutate: func(c *Config) { c.ExpectedIP = "not-an-ip" }},
+		{name: "insecure probe URL", mutate: func(c *Config) { c.ProbeURL = "http://example.com" }},
+		{name: "pattern without capture", mutate: func(c *Config) { c.CountryPattern = `loc=[A-Z]{2}` }},
+		{name: "zero poll", mutate: func(c *Config) { c.PollInterval = "0s" }},
+		{name: "negative handshake age", mutate: func(c *Config) { c.MaxHandshakeAge = "-1s" }},
+		{name: "negative grace", mutate: func(c *Config) { c.KillGrace = "-1s" }},
+		{name: "negative heartbeat", mutate: func(c *Config) { c.HeartbeatInterval = "-1s" }},
+		{name: "negative probe interval", mutate: func(c *Config) { c.ProbeInterval = "-1s" }},
+		{name: "zero probe timeout", mutate: func(c *Config) { c.ProbeTimeout = "0s" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := valid()
+			tc.mutate(&cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Fatalf("invalid config accepted: %+v", cfg)
+			}
+		})
+	}
+}

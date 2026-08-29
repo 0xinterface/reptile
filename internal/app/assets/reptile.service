@@ -14,6 +14,11 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
+RuntimeDirectory=reptile
+RuntimeDirectoryMode=0700
+StateDirectory=reptile
+StateDirectoryMode=0700
+UMask=0077
 # NETLINK: wg show; NET_RAW: ping -I (forces fresh handshakes); NET_ADMIN:
 # SO_BINDTODEVICE for the egress probe; KILL: the kill switch itself.
 CapabilityBoundingSet=CAP_KILL CAP_NET_ADMIN CAP_NET_RAW

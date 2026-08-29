@@ -51,10 +51,12 @@ type EgressChecker struct {
 	LastIP      string
 	Probed      bool
 
-	verdict bool
-	reason  string
-	ts      time.Time
-	set     bool
+	httpClient *http.Client
+	transport  *http.Transport
+	verdict    bool
+	reason     string
+	ts         time.Time
+	set        bool
 }
 
 // Apply hot-applies the mutable subset of a new config. Config fields are
@@ -83,14 +85,19 @@ func (e *EgressChecker) Apply(c Config) error {
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.transport != nil {
+		e.transport.CloseIdleConnections()
+	}
 	e.Iface = c.Interface
 	e.URL = c.ProbeURL
 	e.CountryRe, e.IPRe = countryRe, ipRe
 	e.Timeout, e.TTL = timeout, ttl
 	e.ExpectedCountry = strings.ToUpper(strings.TrimSpace(c.ExpectedCountry))
 	e.ExpectedIP = c.ExpectedIP
-	e.Zones = c.DNSBLZones
-	e.set = false // force a re-probe under the new settings
+	e.Zones = append(e.Zones[:0], c.DNSBLZones...)
+	e.httpClient = nil
+	e.transport = nil
+	e.invalidateLocked()
 	return nil
 }
 
@@ -107,37 +114,79 @@ func (e *EgressChecker) logf(format string, args ...any) {
 	}
 }
 
+// client returns the injected client or a persistent interface-bound client.
+// The caller holds e.mu.
 func (e *EgressChecker) client() *http.Client {
 	if e.Client != nil {
 		return e.Client
 	}
-	return &http.Client{
-		Timeout:   e.Timeout,
-		Transport: &http.Transport{DialContext: ifaceDialer(e.Iface, e.Timeout).DialContext},
+	if e.httpClient == nil {
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.Proxy = nil
+		tr.DialContext = ifaceDialer(e.Iface, e.Timeout).DialContext
+		e.transport = tr
+		e.httpClient = &http.Client{Timeout: e.Timeout, Transport: tr}
 	}
+	return e.httpClient
 }
 
-func (e *EgressChecker) Check(ctx context.Context) (bool, string) {
+type egressResult struct {
+	OK      bool
+	Reason  string
+	IP      string
+	Country string
+	Probed  bool
+}
+
+func (e *EgressChecker) evaluate(ctx context.Context, fresh bool) egressResult {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	now := e.now()
-	if e.set && now.Sub(e.ts) < e.TTL {
+	if !fresh && e.set && now.Sub(e.ts) < e.TTL {
 		e.Probed = false
-		return e.verdict, e.reason
+		return egressResult{
+			OK: e.verdict, Reason: e.reason,
+			IP: e.LastIP, Country: e.LastCountry,
+		}
 	}
 	ok, reason := e.probe(ctx)
 	e.verdict, e.reason, e.ts, e.set = ok, reason, now, true
 	e.Probed = true
-	return ok, reason
+	return egressResult{
+		OK: ok, Reason: reason, IP: e.LastIP, Country: e.LastCountry, Probed: true,
+	}
+}
+
+func (e *EgressChecker) Check(ctx context.Context) (bool, string) {
+	result := e.evaluate(ctx, false)
+	return result.OK, result.Reason
 }
 
 // CheckFresh bypasses the verdict cache and runs a probe now.
 func (e *EgressChecker) CheckFresh(ctx context.Context) (bool, string) {
+	result := e.evaluate(ctx, true)
+	return result.OK, result.Reason
+}
+
+// Invalidate discards proof tied to the current tunnel session. The next
+// Check must probe the newly established session instead of using its cache.
+func (e *EgressChecker) Invalidate() {
 	e.mu.Lock()
-	e.set = false
-	e.mu.Unlock()
-	return e.Check(ctx)
+	defer e.mu.Unlock()
+	e.invalidateLocked()
+}
+
+func (e *EgressChecker) invalidateLocked() {
+	e.verdict, e.reason, e.ts, e.set = false, "", time.Time{}, false
+	e.LastCountry, e.LastIP, e.Probed = "", "", false
+}
+
+// Proof returns an internally consistent snapshot of the last observation.
+func (e *EgressChecker) Proof() (ip, country string, probed bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.LastIP, e.LastCountry, e.Probed
 }
 
 func (e *EgressChecker) probe(ctx context.Context) (bool, string) {

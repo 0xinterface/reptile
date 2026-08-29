@@ -37,10 +37,13 @@ func TestSetConfigFileKeysCreatesValidFile(t *testing.T) {
 
 func TestSetConfigFileKeysUpdatesExistingKeepingOtherKeys(t *testing.T) {
 	t.Chdir(t.TempDir())
-	if _, err := SetConfigFileKeys("config.json", []string{"targets", "keep"}); err != nil {
+	if _, err := SetConfigFileKeys("config.json", []string{
+		"targets", "keep",
+		"expected_country", "CH",
+	}); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := SetConfigFileKeys("config.json", []string{"expected_country", "CH"})
+	cfg, err := SetConfigFileKeys("config.json", []string{"poll_interval", "5s"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,6 +54,12 @@ func TestSetConfigFileKeysUpdatesExistingKeepingOtherKeys(t *testing.T) {
 
 func TestSetConfigFileKeysValidation(t *testing.T) {
 	t.Chdir(t.TempDir())
+	if _, err := SetConfigFileKeys("config.json", []string{
+		"targets", "keep",
+		"expected_country", "CH",
+	}); err != nil {
+		t.Fatal(err)
+	}
 	cases := []struct {
 		name  string
 		pairs []string

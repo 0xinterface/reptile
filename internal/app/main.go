@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -16,15 +17,16 @@ import (
 
 const defaultConfigPath = "/etc/reptile/config.json"
 
-// restartRequiredKeys are settings that only take effect when the daemon
-// restarts (they wire up listeners, log sinks or runners at startup).
-var restartRequiredKeys = map[string]bool{
-	"interface":          true,
-	"socket_path":        true,
-	"log_file":           true,
-	"wg_conf":            true,
-	"extra_accept":       true,
-	"heartbeat_interval": true,
+var daemonRestartKeys = map[string]bool{
+	"interface":   true,
+	"socket_path": true,
+	"log_file":    true,
+}
+
+var firewallReloadKeys = map[string]bool{
+	"interface":    true,
+	"wg_conf":      true,
+	"extra_accept": true,
 }
 
 func Run() {
@@ -180,12 +182,15 @@ func runDaemon(cfg Config, configPath string) {
 		}()
 	}
 
-	killLog := func(event string, pid int, comm string) {
-		if event == "list_failed" {
-			slog.Warn("process listing failed - cannot scan for target processes")
-			return
+	killLog := func(event string, pid int, comm string, err error) {
+		switch {
+		case err == nil:
+			slog.Warn("sent "+event, "comm", comm, "pid", pid)
+		case errors.Is(err, syscall.ESRCH):
+			slog.Info("process exited before "+event, "comm", comm, "pid", pid)
+		default:
+			slog.Error("failed "+event, "comm", comm, "pid", pid, "err", err)
 		}
-		slog.Warn("sent "+event, "comm", comm, "pid", pid)
 	}
 	killer := func() {
 		c := live.Get()
@@ -193,28 +198,42 @@ func runDaemon(cfg Config, configPath string) {
 		if err != nil {
 			gd = d
 		}
-		KillTargets(ctx, procLister{}, c.Targets, gd.killGrace, killLog)
+		_, err = killTargets(ctx, c.Targets, killOptions{
+			Lister: procLister{},
+			Grace:  gd.killGrace,
+			Log:    killLog,
+		})
+		if err != nil {
+			slog.Error("target enforcement incomplete", "err", err)
+		}
 	}
-	egress := func() (bool, string) {
-		ok, reason := eg.Check(ctx)
-		if eg.Probed {
-			if ok {
-				slog.Info("egress verified", "country", eg.LastCountry, "ip", eg.LastIP)
-			} else {
-				slog.Warn("egress check failed", "reason", reason,
-					"observed_country", eg.LastCountry, "observed_ip", eg.LastIP)
-			}
+	tunnel := func() (bool, string) {
+		ok, reason := tc.Check(ctx)
+		if !ok {
+			eg.Invalidate()
 		}
 		return ok, reason
 	}
+	egress := func() (bool, string) {
+		result := eg.evaluate(ctx, false)
+		if result.Probed {
+			if result.OK {
+				slog.Info("egress verified", "country", result.Country, "ip", result.IP)
+			} else {
+				slog.Warn("egress check failed", "reason", result.Reason,
+					"observed_country", result.Country, "observed_ip", result.IP)
+			}
+		}
+		return result.OK, result.Reason
+	}
 	proof := func() (string, string) {
-		st := store.Snapshot()
-		return st.ExitIP, st.Country
+		ip, country, _ := eg.Proof()
+		return ip, country
 	}
 	logf := func(format string, args ...any) { slog.Info(fmt.Sprintf(format, args...)) }
 
 	if err := runWatchdog(ctx, live,
-		func() (bool, string) { return tc.Check(ctx) },
+		tunnel,
 		egress,
 		proof,
 		killer,
@@ -225,37 +244,51 @@ func runDaemon(cfg Config, configPath string) {
 	}
 }
 
-// makeReloader returns the agent "reload" implementation: re-read the config
-// file, hot-apply everything that can change safely on a running daemon
-// (checkers, thresholds, targets, probe settings), and report which changed
-// keys need a restart instead.
-func makeReloader(configPath string, live *Live, tc *TunnelChecker, eg *EgressChecker) func() ([]string, []string, error) {
-	return func() ([]string, []string, error) {
+// makeReloader hot-applies safe settings and reports service-specific
+// lifecycle work for settings wired at startup.
+func makeReloader(configPath string, live *Live, tc *TunnelChecker, eg *EgressChecker) func() (reloadResult, error) {
+	return func() (reloadResult, error) {
 		newCfg, err := LoadConfig(configPath)
 		if err != nil {
-			return nil, nil, err
+			return reloadResult{}, err
 		}
 		if err := newCfg.Validate(); err != nil {
-			return nil, nil, err
-		}
-		if err := eg.Apply(newCfg); err != nil {
-			return nil, nil, err
-		}
-		if err := tc.Apply(newCfg); err != nil {
-			return nil, nil, err
+			return reloadResult{}, err
 		}
 		old := live.Get()
-		live.Set(newCfg)
 		changed := diffKeys(old, newCfg)
-		var restart []string
-		for _, k := range changed {
-			if restartRequiredKeys[k] {
-				restart = append(restart, k)
-			}
+		result := classifyReload(changed)
+
+		effective := newCfg
+		effective.Interface = old.Interface
+		effective.SocketPath = old.SocketPath
+		effective.LogFile = old.LogFile
+		if err := eg.Apply(effective); err != nil {
+			return reloadResult{}, err
 		}
+		if err := tc.Apply(effective); err != nil {
+			return reloadResult{}, err
+		}
+		live.Set(effective)
 		slog.Info("config reloaded", "changed", strings.Join(changed, ","))
-		return changed, restart, nil
+		return result, nil
 	}
+}
+
+func classifyReload(changed []string) reloadResult {
+	result := reloadResult{}
+	for _, key := range changed {
+		if daemonRestartKeys[key] {
+			result.DaemonRestartRequired = append(result.DaemonRestartRequired, key)
+		}
+		if firewallReloadKeys[key] {
+			result.FirewallReloadRequired = append(result.FirewallReloadRequired, key)
+		}
+		if !daemonRestartKeys[key] && !firewallReloadKeys[key] {
+			result.Applied = append(result.Applied, key)
+		}
+	}
+	return result
 }
 
 // probeNow runs a full fresh evaluation for the agent "probe" command and
@@ -263,16 +296,19 @@ func makeReloader(configPath string, live *Live, tc *TunnelChecker, eg *EgressCh
 func probeNow(live *Live, tc *TunnelChecker, eg *EgressChecker, ctx context.Context, store *Store) Status {
 	c := live.Get()
 	tOK, tReason := tc.Check(ctx)
-	eOK := false
+	result := egressResult{}
 	reason := tReason
-	if c.VerifyEgress && tOK {
-		eOK, reason = eg.CheckFresh(ctx)
+	if !tOK {
+		eg.Invalidate()
+	} else if c.VerifyEgress {
+		result = eg.evaluate(ctx, true)
+		reason = result.Reason
 	}
 	state := "up"
-	if !(tOK && (!c.VerifyEgress || eOK)) {
+	if !(tOK && (!c.VerifyEgress || result.OK)) {
 		state = "down"
 	}
-	store.Set(state, store.Snapshot().Streak, reason, eg.LastIP, eg.LastCountry)
+	store.SetProbe(state, reason, result.IP, result.Country)
 	return store.Snapshot()
 }
 
@@ -322,20 +358,25 @@ func runHistory(cfg Config, args []string) int {
 		slog.Error("log file disabled (log_file is empty in config)")
 		return 1
 	}
-	data, err := os.ReadFile(cfg.LogFile)
-	if err != nil {
-		slog.Error("cannot read log file", "file", cfg.LogFile, "err", err)
-		return 1
+	if *n < 0 || *n > maxHistoryEntries {
+		slog.Error(fmt.Sprintf("invalid -n %d (want 0..%d)", *n, maxHistoryEntries))
+		return 2
 	}
 	min, ok := map[string]int{"info": RankInfo, "warn": RankWarn, "error": RankError}[*level]
 	if !ok {
 		slog.Error(fmt.Sprintf("invalid -level %q (want info|warn|error)", *level))
 		return 2
 	}
-	entries := ParseEvents(strings.Split(string(data), "\n"))
-	entries = FilterMin(entries, min)
-	if len(entries) > *n {
-		entries = entries[len(entries)-*n:]
+	f, err := os.Open(cfg.LogFile)
+	if err != nil {
+		slog.Error("cannot read log file", "file", cfg.LogFile, "err", err)
+		return 1
+	}
+	defer f.Close()
+	entries, err := ReadRecentEvents(f, min, *n)
+	if err != nil {
+		slog.Error("cannot parse log file", "file", cfg.LogFile, "err", err)
+		return 1
 	}
 	if err := RenderEntries(os.Stdout, entries, !*noColor && stdoutIsTTY()); err != nil {
 		slog.Error(fmt.Sprintf("render: %v", err))
@@ -370,34 +411,54 @@ func runConfig(configPath string, args []string) int {
 		slog.Error("usage: reptile config set key value [key value ...]")
 		return 2
 	}
-	if _, err := SetConfigFileKeys(configPath, pairs); err != nil {
+	current, err := LoadConfig(configPath)
+	if err != nil {
+		slog.Error(fmt.Sprintf("load current config: %v", err))
+		return 1
+	}
+	fresh, err := SetConfigFileKeys(configPath, pairs)
+	if err != nil {
 		slog.Error(fmt.Sprintf("config set: %v", err))
 		return 1
 	}
-
-	fresh, err := LoadConfig(configPath)
-	if err != nil {
-		slog.Error(fmt.Sprintf("reload config: %v", err))
-		return 1
-	}
-	if fresh.SocketPath == "" {
-		slog.Info("saved; agent socket disabled, changes apply on next start")
+	required := classifyReload(diffKeys(current, fresh))
+	if current.SocketPath == "" {
+		slog.Info("saved; agent socket disabled, daemon changes apply on next start")
+		if len(required.FirewallReloadRequired) > 0 {
+			slog.Warn("firewall reload required",
+				"keys", strings.Join(required.FirewallReloadRequired, ","),
+				"command", "systemctl reload reptile-firewall")
+		}
 		return 0
 	}
-	resp, err := QueryResponse(fresh.SocketPath, "reload")
-	switch {
-	case err == nil:
-		if len(resp.Applied) > 0 {
-			slog.Info("applied live", "keys", strings.Join(resp.Applied, ","))
-		} else {
-			slog.Info("daemon reports no effective changes")
-		}
-		if len(resp.RestartRequired) > 0 {
-			slog.Warn("restart required for these keys", "keys", strings.Join(resp.RestartRequired, ","))
-		}
-	default:
+	resp, err := QueryResponse(current.SocketPath, "reload")
+	if err != nil {
 		slog.Warn("daemon not reloaded live", "err", err.Error())
-		slog.Info("changes apply on next start: systemctl restart reptile")
+		slog.Info("daemon changes apply on next start", "command", "systemctl restart reptile")
+		if len(required.FirewallReloadRequired) > 0 {
+			slog.Warn("firewall reload required",
+				"keys", strings.Join(required.FirewallReloadRequired, ","),
+				"command", "systemctl reload reptile-firewall")
+		}
+		return 0
+	}
+	if len(resp.Applied) > 0 {
+		slog.Info("applied live", "keys", strings.Join(resp.Applied, ","))
+	}
+	if len(resp.DaemonRestartRequired) > 0 {
+		slog.Warn("daemon restart required",
+			"keys", strings.Join(resp.DaemonRestartRequired, ","),
+			"command", "systemctl restart reptile")
+	}
+	if len(resp.FirewallReloadRequired) > 0 {
+		slog.Warn("firewall reload required",
+			"keys", strings.Join(resp.FirewallReloadRequired, ","),
+			"command", "systemctl reload reptile-firewall")
+	}
+	if len(resp.Applied) == 0 &&
+		len(resp.DaemonRestartRequired) == 0 &&
+		len(resp.FirewallReloadRequired) == 0 {
+		slog.Info("daemon reports no effective changes")
 	}
 	return 0
 }
@@ -418,26 +479,30 @@ func runCheck(cfg Config) int {
 	if !cfg.VerifyEgress {
 		return 0
 	}
-	ok, ereason := eg.Check(ctx)
-	if !ok {
-		slog.Error("egress: FAILED", "reason", ereason)
+	result := eg.evaluate(ctx, false)
+	if !result.OK {
+		slog.Error("egress: FAILED", "reason", result.Reason)
 		return 1
 	}
-	slog.Info("egress: OK", "expected_country", cfg.ExpectedCountry, "ip", eg.LastIP, "country", eg.LastCountry)
+	slog.Info("egress: OK",
+		"expected_country", cfg.ExpectedCountry,
+		"ip", result.IP,
+		"country", result.Country,
+	)
 	return 0
 }
 
 func runFirewall(cfg Config, action string) {
 	switch action {
 	case "up":
-		ports, err := EndpointPorts(cfg.WGConf)
+		endpoints, err := parseEndpoints(cfg.WGConf)
 		if err != nil {
 			fatal("firewall: %v", err)
 		}
-		if err := ApplyRuleset(BuildRuleset(cfg.Interface, ports, cfg.ExtraAccept)); err != nil {
+		if err := ApplyRuleset(buildRuleset(cfg.Interface, endpoints, cfg.ExtraAccept)); err != nil {
 			fatal("firewall: %v", err)
 		}
-		slog.Info("kill-switch firewall engaged", "interface", cfg.Interface, "transport_ports", ports)
+		slog.Info("kill-switch firewall engaged", "interface", cfg.Interface, "transport_endpoints", endpoints)
 	case "down":
 		if err := ApplyDown(); err != nil {
 			fatal("firewall: %v", err)

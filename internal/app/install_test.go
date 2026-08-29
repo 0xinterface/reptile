@@ -38,6 +38,15 @@ func TestInstallWritesFilesUnderRoot(t *testing.T) {
 	if !strings.Contains(string(unit), "ExecStart=/usr/local/bin/reptile standby") {
 		t.Errorf("unit ExecStart wrong:\n%s", unit)
 	}
+	for _, directive := range []string{
+		"RuntimeDirectory=reptile",
+		"StateDirectory=reptile",
+		"UMask=0077",
+	} {
+		if !strings.Contains(string(unit), directive) {
+			t.Errorf("unit missing %s:\n%s", directive, unit)
+		}
+	}
 	fw, err := os.ReadFile(filepath.Join(root, "etc/systemd/system/reptile-firewall.service"))
 	if err != nil {
 		t.Fatalf("firewall unit not installed: %v", err)

@@ -3,6 +3,7 @@ package app
 import (
 	"bufio"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"regexp"
@@ -13,11 +14,15 @@ const nftTable = "inet reptile"
 
 var endpointRe = regexp.MustCompile(`(?i)^\s*Endpoint\s*=\s*(.+)$`)
 
-// EndpointPorts extracts the unique transport ports of every Endpoint in a
-// wg-quick config. Hostname endpoints and [v6]:port forms are handled.
-// Without these ports allowed in the kill-switch firewall, the tunnel could
-// never re-establish, so a missing port is a hard error.
-func EndpointPorts(path string) ([]string, error) {
+type endpoint struct {
+	IP   net.IP
+	Port string
+}
+
+// parseEndpoints extracts literal endpoint address-and-port tuples from a
+// wg-quick config. Hostnames are rejected: permitting a port without its
+// resolved address would create a general-purpose non-tunnel UDP bypass.
+func parseEndpoints(path string) ([]endpoint, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -25,34 +30,35 @@ func EndpointPorts(path string) ([]string, error) {
 	defer f.Close()
 
 	seen := map[string]bool{}
-	var ports []string
+	endpoints := []endpoint{}
 	sc := bufio.NewScanner(f)
-	for sc.Scan() {
+	for line := 1; sc.Scan(); line++ {
 		m := endpointRe.FindStringSubmatch(sc.Text())
 		if m == nil {
 			continue
 		}
-		host := strings.TrimSpace(m[1])
-		i := strings.LastIndex(host, ":")
-		if i < 0 {
-			continue
+		raw := strings.TrimSpace(m[1])
+		host, port, err := net.SplitHostPort(raw)
+		if err != nil || !isPort(port) {
+			return nil, fmt.Errorf("%s:%d: invalid Endpoint %q", path, line, raw)
 		}
-		p := host[i+1:]
-		if !isPort(p) {
-			continue
+		ip := net.ParseIP(host)
+		if ip == nil {
+			return nil, fmt.Errorf("%s:%d: Endpoint %q uses a hostname; the fail-closed firewall requires a literal IP address", path, line, raw)
 		}
-		if !seen[p] {
-			seen[p] = true
-			ports = append(ports, p)
+		key := ip.String() + ":" + port
+		if !seen[key] {
+			seen[key] = true
+			endpoints = append(endpoints, endpoint{IP: ip, Port: port})
 		}
 	}
 	if err := sc.Err(); err != nil {
 		return nil, err
 	}
-	if len(ports) == 0 {
-		return nil, fmt.Errorf("no numeric Endpoint port found in %s: the kill-switch firewall would block the tunnel from ever reconnecting", path)
+	if len(endpoints) == 0 {
+		return nil, fmt.Errorf("no valid Endpoint found in %s: the kill-switch firewall would block the tunnel from reconnecting", path)
 	}
-	return ports, nil
+	return endpoints, nil
 }
 
 func isPort(s string) bool {
@@ -69,23 +75,26 @@ func isPort(s string) bool {
 	return n >= 1 && n <= 65535
 }
 
-// BuildRuleset renders the always-on egress kill switch: everything leaving
-// the host is dropped except loopback, the tunnel itself, the WireGuard
-// transport ports (so the tunnel can reconnect), DHCP renewal, and any
-// user-supplied extra accepts.
-func BuildRuleset(iface string, ports, extra []string) string {
+// buildRuleset renders the always-on egress kill switch. Physical-interface
+// traffic is limited to exact WireGuard endpoints, DHCP, and the IPv6 control
+// packets needed to discover an on-link router or endpoint.
+func buildRuleset(iface string, endpoints []endpoint, extra []string) string {
 	var b strings.Builder
 	b.WriteString("table " + nftTable + " {\n")
 	b.WriteString("  chain out {\n")
 	b.WriteString("    type filter hook output priority filter; policy drop;\n")
 	b.WriteString("    oifname \"lo\" accept\n")
 	fmt.Fprintf(&b, "    oifname %q accept\n", iface)
-	b.WriteString("    ct state established,related accept\n")
-	for _, p := range ports {
-		fmt.Fprintf(&b, "    udp dport %s accept\n", p)
+	for _, ep := range endpoints {
+		if ep.IP.To4() != nil {
+			fmt.Fprintf(&b, "    ip daddr %s udp dport %s accept\n", ep.IP.String(), ep.Port)
+		} else {
+			fmt.Fprintf(&b, "    ip6 daddr %s udp dport %s accept\n", ep.IP.String(), ep.Port)
+		}
 	}
 	b.WriteString("    udp sport 68 udp dport 67 accept\n")
 	b.WriteString("    udp sport 546 udp dport 547 accept\n")
+	b.WriteString("    icmpv6 type { nd-router-solicit, nd-neighbor-solicit } accept\n")
 	for _, e := range extra {
 		fmt.Fprintf(&b, "    %s\n", strings.TrimSpace(e))
 	}
@@ -94,33 +103,58 @@ func BuildRuleset(iface string, ports, extra []string) string {
 	return b.String()
 }
 
-func nftRun(args ...string) error {
-	cmd := exec.Command("nft", args...)
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+func nftTablePresent() (bool, error) {
+	out, err := exec.Command("nft", "list", "tables").CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("nft list tables: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		f := strings.Fields(line)
+		if len(f) == 3 && f[0] == "table" && f[1] == "inet" && f[2] == "reptile" {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
-// ApplyRuleset atomically hands the ruleset to nft on stdin, then verifies
-// the table exists.
+// ApplyRuleset replaces the table in one nft transaction, then verifies it.
 func ApplyRuleset(rs string) error {
+	present, err := nftTablePresent()
+	if err != nil {
+		return err
+	}
+	if present {
+		rs = "delete table " + nftTable + "\n" + rs
+	}
 	cmd := exec.Command("nft", "-f", "-")
 	cmd.Stdin = strings.NewReader(rs)
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("nft -f -: %w", err)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("nft -f -: %w: %s", err, strings.TrimSpace(string(out)))
 	}
-	if err := nftRun("list", "table", "inet", "reptile"); err != nil {
+	present, err = nftTablePresent()
+	if err != nil {
 		return fmt.Errorf("post-load verification failed: %w", err)
+	}
+	if !present {
+		return fmt.Errorf("post-load verification failed: table %s is absent", nftTable)
 	}
 	return nil
 }
 
-// ApplyDown removes the table. A missing table (fresh host, already removed)
-// is not an error; a missing nft binary is.
+// ApplyDown removes the table. An already absent table is successful; every
+// actual nft failure is returned.
 func ApplyDown() error {
-	err := nftRun("delete", "table", "inet", "reptile")
-	if _, isExit := err.(*exec.ExitError); isExit {
+	present, err := nftTablePresent()
+	if err != nil {
+		return err
+	}
+	if !present {
 		return nil
 	}
-	return err
+	out, err := exec.Command("nft", "delete", "table", "inet", "reptile").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("nft delete table %s: %w: %s", nftTable, err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }

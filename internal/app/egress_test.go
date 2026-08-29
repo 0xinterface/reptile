@@ -289,3 +289,48 @@ func TestEgressCheckFreshBypassesCache(t *testing.T) {
 		t.Fatalf("hits = %d, want 2 (fresh must not read cache)", hits)
 	}
 }
+
+func TestEgressInvalidateForcesProofAfterReconnect(t *testing.T) {
+	var (
+		body atomic.Value
+		hits atomic.Int32
+	)
+	body.Store("ip=198.51.100.7\nloc=CH\n")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		fmt.Fprint(w, body.Load().(string))
+	}))
+	defer srv.Close()
+
+	e := baseChecker(t, srv)
+	e.TTL = time.Hour
+	if ok, reason := e.Check(context.Background()); !ok {
+		t.Fatalf("initial proof failed: %s", reason)
+	}
+	body.Store("ip=198.51.100.8\nloc=DE\n")
+	e.Invalidate()
+	if ip, country, _ := e.Proof(); ip != "" || country != "" {
+		t.Fatalf("invalidated proof retained %s/%s", country, ip)
+	}
+	if ok, reason := e.Check(context.Background()); ok || !strings.Contains(reason, "country DE") {
+		t.Fatalf("reconnected proof = ok %v, reason %q", ok, reason)
+	}
+	if hits.Load() != 2 {
+		t.Fatalf("probe hits = %d, want 2", hits.Load())
+	}
+}
+
+func TestEgressReusesHTTPClient(t *testing.T) {
+	e := &EgressChecker{Timeout: time.Second}
+	e.mu.Lock()
+	first := e.client()
+	second := e.client()
+	e.mu.Unlock()
+	if first != second {
+		t.Fatal("client was rebuilt instead of reused")
+	}
+	if e.transport == nil {
+		t.Fatal("persistent transport was not retained")
+	}
+	e.transport.CloseIdleConnections()
+}

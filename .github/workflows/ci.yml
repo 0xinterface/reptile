@@ -46,6 +46,23 @@ jobs:
       - name: go test (race detector)
         run: go test -race -count=1 -cover ./...
 
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: install network integration tools
+        run: sudo apt-get update && sudo apt-get install -y nftables iproute2
+      - name: privileged Linux integration tests
+        run: |
+          sudo env "PATH=$PATH" REPTILE_REQUIRE_INTEGRATION=1 \
+            go test -tags=integration -count=1 \
+            -run 'Test(FirewallNamespace|InstalledSystemdSandbox)$' ./internal/app
+
   build:
     runs-on: ubuntu-latest
     strategy:
@@ -54,8 +71,10 @@ jobs:
         include:
           - goos: linux
             goarch: amd64
+            file_arch: x86-64
           - goos: linux
             goarch: arm64
+            file_arch: ARM aarch64
     steps:
       - uses: actions/checkout@v7
         with:
@@ -64,6 +83,10 @@ jobs:
         with:
           go-version-file: go.mod
       - name: build reptile
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
         run: |
           build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           go build -trimpath -ldflags="-s -w \
@@ -74,10 +97,14 @@ jobs:
       - name: version output smoke
         if: matrix.goarch == 'amd64'
         run: ./dist/reptile-${{ matrix.goos }}-${{ matrix.goarch }} version
-      - name: verify binary
+      - name: verify binary architecture
         run: |
           test -x dist/reptile-${{ matrix.goos }}-${{ matrix.goarch }}
-
+          description="$(file dist/reptile-${{ matrix.goos }}-${{ matrix.goarch }})"
+          case "$description" in
+            *"${{ matrix.file_arch }}"*) ;;
+            *) echo "wrong architecture: $description" >&2; exit 1 ;;
+          esac
   goreleaser-check:
     runs-on: ubuntu-latest
     steps:

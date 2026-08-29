@@ -1,7 +1,6 @@
 package app
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -22,6 +21,10 @@ func TestStoreSnapshot(t *testing.T) {
 	if _, err := time.Parse(time.RFC3339, st.UpdatedAt); err != nil {
 		t.Errorf("updated_at %q not RFC3339: %v", st.UpdatedAt, err)
 	}
+	s.SetProbe("up", "", "198.51.100.7", "CH")
+	if st = s.Snapshot(); st.State != "up" || st.Streak != 2 {
+		t.Fatalf("forced probe lost watchdog streak: %+v", st)
+	}
 }
 
 func startServer(t *testing.T, store *Store, prober func() Status) string {
@@ -33,7 +36,7 @@ func startServer(t *testing.T, store *Store, prober func() Status) string {
 		t.Fatalf("Listen: %v", err)
 	}
 	go func() { _ = srv.Serve(ln) }()
-	t.Cleanup(func() { _ = ln.Close() })
+	t.Cleanup(func() { _ = srv.Close() })
 	return ln.Addr().String()
 }
 
@@ -101,6 +104,9 @@ func TestAgentListenReplacesStaleSocket(t *testing.T) {
 	if fi.Mode()&os.ModeSocket == 0 {
 		t.Error("path is not a socket after Listen")
 	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Errorf("socket mode = %o, want 600", fi.Mode().Perm())
+	}
 }
 
 func TestQueryUnreachableSocket(t *testing.T) {
@@ -109,15 +115,17 @@ func TestQueryUnreachableSocket(t *testing.T) {
 	}
 }
 
-var _ = context.Background
-
 func TestAgentReloadCommand(t *testing.T) {
 	t.Chdir(t.TempDir())
 	calls := 0
 	srv := NewServer("agent.sock", NewStore(), nil)
-	srv.Reloader = func() ([]string, []string, error) {
+	srv.Reloader = func() (reloadResult, error) {
 		calls++
-		return []string{"expected_country"}, []string{"interface"}, nil
+		return reloadResult{
+			Applied:                []string{"expected_country"},
+			DaemonRestartRequired:  []string{"interface"},
+			FirewallReloadRequired: []string{"wg_conf"},
+		}, nil
 	}
 	ln, err := srv.Listen()
 	if err != nil {
@@ -136,8 +144,11 @@ func TestAgentReloadCommand(t *testing.T) {
 	if len(resp.Applied) != 1 || resp.Applied[0] != "expected_country" {
 		t.Errorf("applied = %v", resp.Applied)
 	}
-	if len(resp.RestartRequired) != 1 || resp.RestartRequired[0] != "interface" {
-		t.Errorf("restart_required = %v", resp.RestartRequired)
+	if len(resp.DaemonRestartRequired) != 1 || resp.DaemonRestartRequired[0] != "interface" {
+		t.Errorf("daemon_restart_required = %v", resp.DaemonRestartRequired)
+	}
+	if len(resp.FirewallReloadRequired) != 1 || resp.FirewallReloadRequired[0] != "wg_conf" {
+		t.Errorf("firewall_reload_required = %v", resp.FirewallReloadRequired)
 	}
 
 	if _, err = QueryResponse("agent.sock", "reload-nonsense"); err == nil {

@@ -1,8 +1,12 @@
 package app
 
 import (
+	"context"
+	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func join(logs []string) string { return strings.Join(logs, "\n") }
@@ -100,5 +104,52 @@ func TestWatchdogQuietWhenSteadyUp(t *testing.T) {
 	}
 	if s2.streak != 0 {
 		t.Errorf("streak = %d, want 0", s2.streak)
+	}
+}
+
+func TestRunWatchdogDrivesDebounceAndPublishesState(t *testing.T) {
+	cfg := Defaults()
+	cfg.Targets = []string{"worker"}
+	cfg.ExpectedCountry = "CH"
+	cfg.VerifyEgress = false
+	cfg.PollInterval = "5ms"
+	cfg.HeartbeatInterval = "0s"
+	cfg.DownCyclesToKill = 2
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var (
+		tunnelCalls atomic.Int32
+		kills       atomic.Int32
+	)
+	store := NewStore()
+	err := runWatchdog(
+		ctx,
+		NewLive(cfg),
+		func() (bool, string) {
+			tunnelCalls.Add(1)
+			return false, "no handshake"
+		},
+		func() (bool, string) {
+			t.Fatal("egress must not run while the tunnel is down")
+			return false, ""
+		},
+		func() (string, string) { return "", "" },
+		func() {
+			kills.Add(1)
+			cancel()
+		},
+		store,
+		func(string, ...any) {},
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("runWatchdog error = %v, want context cancellation", err)
+	}
+	if tunnelCalls.Load() < 2 || kills.Load() != 1 {
+		t.Fatalf("tunnel calls=%d kills=%d, want at least 2/1", tunnelCalls.Load(), kills.Load())
+	}
+	status := store.Snapshot()
+	if status.State != "down" || status.Streak < 2 || status.Reason != "no handshake" {
+		t.Fatalf("status = %+v, want confirmed down state", status)
 	}
 }

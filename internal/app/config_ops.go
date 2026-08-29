@@ -79,11 +79,9 @@ func diffKeys(old, new Config) []string {
 }
 
 // SetConfigFileKeys applies key=value pairs to the config file (creating it
-// from defaults when missing) and persists it atomically (temp file +
-// rename, 0600). pairs is a flat ["key", "value", ...] slice. Each key is
-// syntax-checked; complete-config validation happens at daemon start and on
-// hot reload, so `config set` may produce an intermediate config (e.g.
-// targets set before expected_country).
+// from defaults when missing), validates the complete result, and persists it
+// atomically (temp file + rename, 0600). pairs is a flat
+// ["key", "value", ...] slice.
 func SetConfigFileKeys(path string, pairs []string) (Config, error) {
 	if len(pairs)%2 != 0 {
 		return Config{}, fmt.Errorf("odd number of key/value arguments")
@@ -99,6 +97,9 @@ func SetConfigFileKeys(path string, pairs []string) (Config, error) {
 		if err := applyKey(&cfg, pairs[i], pairs[i+1]); err != nil {
 			return Config{}, err
 		}
+	}
+	if err := cfg.Validate(); err != nil {
+		return Config{}, fmt.Errorf("resulting config is invalid: %w", err)
 	}
 
 	out, err := json.MarshalIndent(cfg, "", "  ")
