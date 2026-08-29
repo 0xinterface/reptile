@@ -1,0 +1,23 @@
+[Unit]
+Description=WireGuard kill switch watchdog
+After=network-online.target wg-quick@wg0.service
+Wants=network-online.target
+# Deliberately no Requires/BindsTo on wg-quick@wg0: the watchdog must keep
+# running while the tunnel is down - that is the whole point.
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/reptile standby
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# NETLINK: wg show; NET_RAW: ping -I (forces fresh handshakes); NET_ADMIN:
+# SO_BINDTODEVICE for the egress probe; KILL: the kill switch itself.
+CapabilityBoundingSet=CAP_KILL CAP_NET_ADMIN CAP_NET_RAW
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

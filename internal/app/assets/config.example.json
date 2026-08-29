@@ -1,0 +1,23 @@
+{
+  "interface": "wg0",
+  "poll_interval": "10s",
+  "max_handshake_age": "180s",
+  "down_cycles_to_kill": 2,
+  "kill_grace": "3s",
+  "heartbeat_interval": "10m",
+  "ping_target": "",
+  "verify_egress": true,
+  "expected_country": "CHANGE_ME",
+  "expected_ip": "",
+  "probe_url": "https://1.1.1.1/cdn-cgi/trace",
+  "country_pattern": "(?m)^loc=([A-Z]{2})",
+  "ip_pattern": "(?m)^ip=([0-9a-fA-F.:]+)",
+  "probe_interval": "300s",
+  "probe_timeout": "5s",
+  "dnsbl_zones": ["zen.spamhaus.org", "b.barracudacentral.org", "bl.spamcop.net"],
+  "targets": ["CHANGE_ME"],
+  "wg_conf": "/etc/wireguard/wg0.conf",
+  "extra_accept": [],
+  "socket_path": "/run/reptile/agent.sock",
+  "log_file": "/var/lib/reptile/events.log"
+}

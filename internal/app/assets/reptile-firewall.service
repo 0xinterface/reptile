@@ -1,0 +1,23 @@
+[Unit]
+Description=WireGuard kill switch firewall (egress via VPN only)
+DefaultDependencies=no
+After=systemd-modules-load.service network-pre.target
+Before=network.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/reptile firewall up
+ExecReload=/usr/local/bin/reptile firewall up
+ExecStop=/usr/local/bin/reptile firewall down
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# nft talks netlink and needs NET_ADMIN; RAW kept for conservative setups.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
