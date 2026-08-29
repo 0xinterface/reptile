@@ -209,6 +209,18 @@ sudo wg-quick up wg0
 reptile status                     # state=up again (killed targets stay dead)
 ```
 
+## Releasing
+
+1. GitHub → **Actions → tag → Run workflow** → enter a version (e.g. `v0.1.0`).
+   The workflow validates it, pushes an annotated tag on `main`.
+2. The tag push triggers the `release` workflow: GoReleaser cross-compiles
+   linux amd64/arm64 with full version stamping, generates SHA256 checksums
+   and a changelog from conventional commits, and publishes the GitHub
+   release with all artifacts.
+
+Config: `.goreleaser.yaml`. CI validates it on every PR
+(`goreleaser check` job).
+
 ## Development
 
 ```sh

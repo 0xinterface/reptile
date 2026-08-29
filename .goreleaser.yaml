@@ -1,0 +1,49 @@
+version: 2
+
+project_name: reptile
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: reptile
+    main: ./cmd/reptile
+    binary: reptile
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+        -X github.com/0xinterface/reptile/internal/app.version={{ .Version }}
+        -X github.com/0xinterface/reptile/internal/app.commit={{ .FullCommit }}
+        -X github.com/0xinterface/reptile/internal/app.buildDate={{ .Date }}
+
+archives:
+  - formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+      - Merge pull request
+      - Merge branch
+
+release:
+  draft: false
+  prerelease: auto

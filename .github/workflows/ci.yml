@@ -78,6 +78,18 @@ jobs:
         run: |
           test -x dist/reptile-${{ matrix.goos }}-${{ matrix.goarch }}
 
+  goreleaser-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: latest
+          args: check
+
   vulncheck:
     runs-on: ubuntu-latest
     steps:

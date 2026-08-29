@@ -1,0 +1,43 @@
+name: tag
+
+# Creates and pushes an annotated release tag on main, which kicks off the
+# goreleaser release workflow. Run: Actions -> tag -> Run workflow.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Tag to create, e.g. v0.1.0 (must start with 'v')"
+        required: true
+        type: string
+
+permissions:
+  contents: write # pushing the tag requires it
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: validate version input
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          case "$VERSION" in
+            v[0-9]*) ;;
+            *) echo "version must start with 'v' followed by a number (e.g. v0.1.0), got: $VERSION" >&2; exit 1 ;;
+          esac
+          if git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null; then
+            echo "tag $VERSION already exists" >&2
+            exit 1
+          fi
+      - name: create annotated tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$VERSION" -m "reptile $VERSION"
+          git push origin "$VERSION"
