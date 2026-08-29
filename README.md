@@ -242,8 +242,9 @@ Config: `.goreleaser.yaml`. CI validates it on every PR
 go build ./cmd/reptile        # local build
 go test -race ./...           # portable unit/behavior suite
 sudo env "PATH=/usr/sbin:$PATH" REPTILE_REQUIRE_INTEGRATION=1 \
-  go test -tags=integration -count=1 \
-  -run 'Test(FirewallNamespace|InstalledSystemdSandbox)$' ./internal/app
+  go test -tags=integration -count=1 -run '^TestFirewallNamespace$' ./internal/app
+sudo env "PATH=/usr/sbin:$PATH" REPTILE_REQUIRE_SYSTEMD=1 \
+  go test -tags=integration -count=1 -run '^TestInstalledSystemdSandbox$' ./internal/app
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o dist/reptile-linux-amd64 ./cmd/reptile
 GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o dist/reptile-linux-arm64 ./cmd/reptile
 ```
@@ -261,10 +262,11 @@ toolchain. Stamping precedence:
    commit time. Untagged installs show a `v0.0.0-…` pseudo-version; tag
    releases (`git tag v0.1.0 && git push --tags`) for clean versions.
 
-CI (`.github/workflows/ci.yml`) runs gofmt, `go vet`, race tests, privileged
-nftables/systemd integration tests, an architecture-verified cross-build
-matrix, and `govulncheck` on every push to `main` and every PR. Actions are
-least-privilege (`contents: read`, `persist-credentials: false`).
+CI (`.github/workflows/ci.yml`) runs gofmt, `go vet`, race tests, a privileged
+nftables network-namespace test, offline systemd unit validation, an
+architecture-verified cross-build matrix, and `govulncheck` on every push to
+`main` and every PR. Actions are least-privilege (`contents: read`,
+`persist-credentials: false`).
 
 Layout: `cmd/reptile` is a thin entry point; everything lives in
 `internal/app` (config, tunnel, egress, killer, watchdog, firewall, agent,
@@ -285,8 +287,10 @@ kill logic testable off-Linux.
 - The fail-closed firewall requires literal-IP WireGuard endpoints; hostname
   endpoints are rejected.
 - Log file has no rotation.
-- Privileged Linux CI exercises the real nftables policy in network namespaces
-  and starts the daemon inside its systemd filesystem sandbox.
+- Privileged Linux CI exercises the real nftables policy in network
+  namespaces. GitHub-hosted runners do not provide a running systemd manager,
+  so CI validates the unit files offline; run `TestInstalledSystemdSandbox`
+  explicitly on a systemd host before release.
 
 ## License
 

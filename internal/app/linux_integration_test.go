@@ -16,9 +16,12 @@ import (
 	"time"
 )
 
-const integrationRequiredEnv = "REPTILE_REQUIRE_INTEGRATION"
+const (
+	integrationRequiredEnv = "REPTILE_REQUIRE_INTEGRATION"
+	systemdRequiredEnv     = "REPTILE_REQUIRE_SYSTEMD"
+)
 
-func requireIntegration(t *testing.T, commands ...string) {
+func requireIntegration(t *testing.T, requiredEnv string, commands ...string) {
 	t.Helper()
 	missing := ""
 	if os.Geteuid() != 0 {
@@ -33,7 +36,7 @@ func requireIntegration(t *testing.T, commands ...string) {
 	if missing == "" {
 		return
 	}
-	if os.Getenv(integrationRequiredEnv) == "1" {
+	if os.Getenv(requiredEnv) == "1" {
 		t.Fatalf("required integration prerequisite unavailable: %s", missing)
 	}
 	t.Skipf("integration prerequisite unavailable: %s", missing)
@@ -66,7 +69,7 @@ func TestFirewallNamespace(t *testing.T) {
 		return
 	}
 
-	requireIntegration(t, "ip", "nft")
+	requireIntegration(t, integrationRequiredEnv, "ip", "nft")
 	clientNS := netnsName("rptc")
 	serverNS := netnsName("rpts")
 	clientLink := netnsName("rvc")
@@ -215,11 +218,11 @@ func TestInstalledSystemdSandbox(t *testing.T) {
 		return
 	}
 
-	requireIntegration(t, "systemctl", "systemd-run")
+	requireIntegration(t, systemdRequiredEnv, "systemctl", "systemd-run")
 	state, err := exec.Command("systemctl", "is-system-running").CombinedOutput()
 	stateName := strings.TrimSpace(string(state))
 	if err != nil && stateName != "degraded" {
-		if os.Getenv(integrationRequiredEnv) == "1" {
+		if os.Getenv(systemdRequiredEnv) == "1" {
 			t.Fatalf("systemd is not running: %s (%v)", stateName, err)
 		}
 		t.Skipf("systemd is not running: %s", stateName)
